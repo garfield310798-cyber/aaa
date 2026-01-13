@@ -1,1 +1,1 @@
-powershell -ExecutionPolicy Bypass -File conteo.ps1
+powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "%USERPROFILE%\Desktop\conteo.ps1"
