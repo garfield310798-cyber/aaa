@@ -1,0 +1,157 @@
+# ================================
+# CONTADOR DE ESCANEOS
+# PowerShell oculto / Form visible
+# ================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32]::ShowWindow($h, 0) }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using System.Drawing;
+
+public class EscanerForm : Form
+{
+    private Label lblEscaneos;
+    private Label lblTiempo;
+    private Button btnReset;
+    private Timer timer;
+
+    private static int contador = 0;
+    private static IntPtr hookID = IntPtr.Zero;
+    private static LowLevelKeyboardProc proc = HookCallback;
+
+    public EscanerForm()
+    {
+        this.Text = "Contador de Escaneos";
+        this.Size = new Size(360,180);
+        this.StartPosition = FormStartPosition.CenterScreen;
+        this.TopMost = true;
+        this.FormBorderStyle = FormBorderStyle.FixedDialog;
+        this.MaximizeBox = false;
+
+        lblEscaneos = new Label();
+        lblEscaneos.Text = "Escaneos: 0";
+        lblEscaneos.Font = new Font("Arial", 20, FontStyle.Bold);
+        lblEscaneos.TextAlign = ContentAlignment.MiddleCenter;
+        lblEscaneos.Dock = DockStyle.Top;
+        lblEscaneos.Height = 60;
+
+        lblTiempo = new Label();
+        lblTiempo.Font = new Font("Arial", 12);
+        lblTiempo.TextAlign = ContentAlignment.MiddleCenter;
+        lblTiempo.Dock = DockStyle.Top;
+        lblTiempo.Height = 30;
+
+        btnReset = new Button();
+        btnReset.Text = "Reset";
+        btnReset.Dock = DockStyle.Bottom;
+        btnReset.Height = 35;
+        btnReset.Click += (s,e) =>
+        {
+            contador = 0;
+            lblEscaneos.Text = "Escaneos: 0";
+        };
+
+        this.Controls.Add(btnReset);
+        this.Controls.Add(lblTiempo);
+        this.Controls.Add(lblEscaneos);
+
+        hookID = SetHook(proc);
+
+        timer = new Timer();
+        timer.Interval = 1000;
+        timer.Tick += TimerTick;
+        timer.Start();
+
+        ActualizarTiempo();
+    }
+
+    private void TimerTick(object sender, EventArgs e)
+    {
+        ActualizarTiempo();
+    }
+
+    private void ActualizarTiempo()
+    {
+        DateTime ahora = DateTime.Now;
+        DateTime siguienteHora = new DateTime(
+            ahora.Year, ahora.Month, ahora.Day,
+            ahora.Hour, 0, 0).AddHours(1);
+
+        TimeSpan restante = siguienteHora - ahora;
+
+        lblTiempo.Text = string.Format(
+            "Tiempo a la hora en punto: {0:D2}:{1:D2}",
+            restante.Minutes,
+            restante.Seconds
+        );
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        UnhookWindowsHookEx(hookID);
+        base.OnFormClosed(e);
+    }
+
+    private static IntPtr SetHook(LowLevelKeyboardProc proc)
+    {
+        return SetWindowsHookEx(13, proc, IntPtr.Zero, 0);
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam == (IntPtr)0x0100)
+        {
+            int vkCode = Marshal.ReadInt32(lParam);
+
+            if (vkCode == 13 || vkCode == 9)
+            {
+                contador++;
+                EscanerForm f = (EscanerForm)Application.OpenForms[0];
+                f.BeginInvoke((Action)(() =>
+                {
+                    f.lblEscaneos.Text = "Escaneos: " + contador;
+                }));
+            }
+        }
+        return CallNextHookEx(hookID, nCode, wParam, lParam);
+    }
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new EscanerForm());
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+}
+"@
+
+# 🚀 ARRANCAR LA VENTANA
+[EscanerForm]::Main()
