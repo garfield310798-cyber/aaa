@@ -1,0 +1,82 @@
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using System.Drawing;
+
+public class EscanerForm : Form
+{
+    private Label lbl;
+    private static int contador = 0;
+    private static IntPtr hookID = IntPtr.Zero;
+    private static LowLevelKeyboardProc proc = HookCallback;
+
+    public EscanerForm()
+    {
+        this.Text = "Contador de Escaneos";
+        this.Size = new Size(300,120);
+
+        lbl = new Label();
+        lbl.Text = "Escaneos: 0";
+        lbl.Dock = DockStyle.Fill;
+        lbl.Font = new Font("Arial", 20);
+        lbl.TextAlign = ContentAlignment.MiddleCenter;
+
+        this.Controls.Add(lbl);
+        hookID = SetHook(proc);
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        UnhookWindowsHookEx(hookID);
+        base.OnFormClosed(e);
+    }
+
+    private static IntPtr SetHook(LowLevelKeyboardProc proc)
+    {
+        return SetWindowsHookEx(13, proc, IntPtr.Zero, 0);
+    }
+
+    private delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+    private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+    {
+        if (nCode >= 0 && wParam == (IntPtr)0x0100) // WM_KEYDOWN
+        {
+            int vkCode = Marshal.ReadInt32(lParam);
+            if (vkCode == 13 || vkCode == 9) // ENTER
+            {
+                contador++;
+                EscanerForm f = (EscanerForm)Application.OpenForms[0];
+                f.BeginInvoke((Action)(() =>
+                {
+                    f.lbl.Text = "Escaneos: " + contador;
+                }));
+            }
+        }
+        return CallNextHookEx(hookID, nCode, wParam, lParam);
+    }
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new EscanerForm());
+    }
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SetWindowsHookEx(int idHook, LowLevelKeyboardProc lpfn, IntPtr hMod, uint dwThreadId);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+}
+"@
+
+# 🚀 ARRANCAR LA VENTANA
+[EscanerForm]::Main()
