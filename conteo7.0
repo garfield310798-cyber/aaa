@@ -1,6 +1,6 @@
 # ================================
 # CONTADOR DE ESCANEOS
-# Vista compacta + gráfico
+# Vista compacta / expandible
 # PowerShell 5.1 compatible
 # ================================
 
@@ -52,14 +52,20 @@ public class EscanerForm : Form
     const int HORA_INICIO = 4;
     const int HORA_FIN = 14;
 
+    const int ANCHO_COMPACTO = 210;
+    const int ANCHO_COMPLETO = 420;
+    const int ALTO_COMPACTO = 200;
+    const int ALTO_GRAFICO = 340;
+
     public EscanerForm()
     {
         Text = "Contador";
-        Width = 420;
-        Height = 200;
+        Width = ANCHO_COMPACTO;
+        Height = ALTO_COMPACTO;
         TopMost = true;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
 
         cboModo = new ComboBox();
         cboModo.Items.AddRange(new string[] { "Retail", "ECOM" });
@@ -120,8 +126,19 @@ public class EscanerForm : Form
     {
         graficoVisible = !graficoVisible;
         panelHistorial.Visible = graficoVisible;
-        Height = graficoVisible ? 340 : 200;
-        btnGrafico.Text = graficoVisible ? "Ocultar grafico" : "Mostrar grafico";
+
+        if (graficoVisible)
+        {
+            Width = ANCHO_COMPLETO;
+            Height = ALTO_GRAFICO;
+            btnGrafico.Text = "Ocultar gráfico";
+        }
+        else
+        {
+            Width = ANCHO_COMPACTO;
+            Height = ALTO_COMPACTO;
+            btnGrafico.Text = "Mostrar grafico";
+        }
     }
 
     void Tick(object s, EventArgs e)
@@ -233,32 +250,11 @@ public class EscanerForm : Form
             int x = i * barraAncho + 5;
             int y = alto - barraAlto - 25;
 
-            Rectangle rect = new Rectangle(
-                x,
-                y,
-                barraAncho - 10,
-                barraAlto
-            );
+            e.Graphics.FillRectangle(Brushes.SteelBlue, x, y, barraAncho - 10, barraAlto);
+            e.Graphics.DrawRectangle(Pens.Black, x, y, barraAncho - 10, barraAlto);
 
-            e.Graphics.FillRectangle(Brushes.SteelBlue, rect);
-            e.Graphics.DrawRectangle(Pens.Black, rect);
-
-            e.Graphics.DrawString(
-                valor.ToString(),
-                Font,
-                Brushes.Black,
-                x,
-                y - 15
-            );
-
-            string hora = (HORA_INICIO + i).ToString("D2");
-            e.Graphics.DrawString(
-                hora,
-                Font,
-                Brushes.Black,
-                x,
-                alto - 18
-            );
+            e.Graphics.DrawString(valor.ToString(), Font, Brushes.Black, x, y - 15);
+            e.Graphics.DrawString((HORA_INICIO + i).ToString("D2"), Font, Brushes.Black, x, alto - 18);
         }
     }
 
