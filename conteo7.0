@@ -1,0 +1,291 @@
+# ================================
+# CONTADOR DE ESCANEOS
+# Vista compacta + gráfico
+# PowerShell 5.1 compatible
+# ================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32 {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32]::ShowWindow($h, 0) }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using System.Drawing;
+using System.Text.RegularExpressions;
+
+public class EscanerForm : Form
+{
+    Label lblEscaneos;
+    Label lblTiempo;
+    ComboBox cboModo;
+    Button btnGrafico;
+    Button btnRestar;
+    Panel panelHistorial;
+    Timer timer;
+
+    static int contador = 0;
+    static string buffer = "";
+    static bool ultimoFueECOM = false;
+
+    static IntPtr hookID = IntPtr.Zero;
+    static LowLevelKeyboardProc proc = HookCallback;
+
+    List<int> historial = new List<int>();
+    bool graficoVisible = false;
+    int ultimaHora;
+
+    const int HORA_INICIO = 4;
+    const int HORA_FIN = 14;
+
+    public EscanerForm()
+    {
+        Text = "Contador";
+        Width = 420;
+        Height = 200;
+        TopMost = true;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+
+        cboModo = new ComboBox();
+        cboModo.Items.AddRange(new string[] { "Retail", "ECOM" });
+        cboModo.SelectedIndex = 0;
+        cboModo.Dock = DockStyle.Top;
+
+        lblEscaneos = new Label();
+        lblEscaneos.Text = "0";
+        lblEscaneos.Font = new Font("Arial", 28, FontStyle.Bold);
+        lblEscaneos.Dock = DockStyle.Top;
+        lblEscaneos.TextAlign = ContentAlignment.MiddleCenter;
+        lblEscaneos.Height = 60;
+
+        lblTiempo = new Label();
+        lblTiempo.Dock = DockStyle.Top;
+        lblTiempo.Height = 22;
+        lblTiempo.TextAlign = ContentAlignment.MiddleCenter;
+
+        btnGrafico = new Button();
+        btnGrafico.Text = "Mostrar grafico";
+        btnGrafico.Dock = DockStyle.Top;
+        btnGrafico.Click += ToggleGrafico;
+
+        btnRestar = new Button();
+        btnRestar.Text = "Restar 1";
+        btnRestar.Dock = DockStyle.Top;
+        btnRestar.Click += delegate {
+            if (contador > 0) contador--;
+            lblEscaneos.Text = contador.ToString();
+        };
+
+        panelHistorial = new Panel();
+        panelHistorial.Dock = DockStyle.Fill;
+        panelHistorial.Visible = false;
+        panelHistorial.Paint += DibujarHistorial;
+
+        Controls.Add(panelHistorial);
+        Controls.Add(btnRestar);
+        Controls.Add(btnGrafico);
+        Controls.Add(lblTiempo);
+        Controls.Add(lblEscaneos);
+        Controls.Add(cboModo);
+
+        for (int h = HORA_INICIO; h <= HORA_FIN; h++)
+            historial.Add(0);
+
+        ultimaHora = DateTime.Now.Hour;
+
+        hookID = SetHook(proc);
+
+        timer = new Timer();
+        timer.Interval = 1000;
+        timer.Tick += Tick;
+        timer.Start();
+    }
+
+    void ToggleGrafico(object s, EventArgs e)
+    {
+        graficoVisible = !graficoVisible;
+        panelHistorial.Visible = graficoVisible;
+        Height = graficoVisible ? 340 : 200;
+        btnGrafico.Text = graficoVisible ? "Ocultar grafico" : "Mostrar grafico";
+    }
+
+    void Tick(object s, EventArgs e)
+    {
+        DateTime ahora = DateTime.Now;
+        DateTime siguiente = new DateTime(
+            ahora.Year, ahora.Month, ahora.Day,
+            ahora.Hour, 0, 0).AddHours(1);
+
+        TimeSpan restante = siguiente - ahora;
+        lblTiempo.Text = "Proximo corte en " +
+            restante.Minutes.ToString("D2") + ":" +
+            restante.Seconds.ToString("D2");
+
+        if (ahora.Hour != ultimaHora)
+        {
+            int idx = ultimaHora - HORA_INICIO;
+            if (idx >= 0 && idx < historial.Count)
+                historial[idx] = contador;
+
+            contador = 0;
+            lblEscaneos.Text = "0";
+            panelHistorial.Invalidate();
+            ultimaHora = ahora.Hour;
+        }
+    }
+
+    static bool EsNumerico(string s)
+    {
+        return Regex.IsMatch(s, @"^\d{8,15}$");
+    }
+
+    static bool EsECOM(string s)
+    {
+        return Regex.IsMatch(s, @"^[A-Z]{2}-\d{4}$");
+    }
+
+    static void Procesar(string txt)
+    {
+        if (string.IsNullOrEmpty(txt)) return;
+
+        EscanerForm f = (EscanerForm)Application.OpenForms[0];
+        bool sumar = false;
+
+        if (f.cboModo.Text == "Retail")
+        {
+            if (EsNumerico(txt)) sumar = true;
+        }
+        else
+        {
+            if (EsECOM(txt))
+            {
+                sumar = true;
+                ultimoFueECOM = true;
+            }
+            else if (EsNumerico(txt))
+            {
+                sumar = true;
+                if (ultimoFueECOM) contador--;
+                ultimoFueECOM = false;
+            }
+            else ultimoFueECOM = false;
+        }
+
+        if (sumar)
+        {
+            contador++;
+            f.BeginInvoke((Action)delegate {
+                f.lblEscaneos.Text = contador.ToString();
+            });
+        }
+    }
+
+    static IntPtr HookCallback(int nCode, IntPtr w, IntPtr l)
+    {
+        if (nCode >= 0 && w == (IntPtr)0x0100)
+        {
+            int k = Marshal.ReadInt32(l);
+            if (k >= 48 && k <= 57) buffer += (char)k;
+            else if (k >= 65 && k <= 90) buffer += (char)k;
+            else if (k == 189) buffer += "-";
+            else if (k == 13 || k == 9)
+            {
+                Procesar(buffer);
+                buffer = "";
+            }
+            else buffer = "";
+        }
+        return CallNextHookEx(hookID, nCode, w, l);
+    }
+
+    void DibujarHistorial(object s, PaintEventArgs e)
+    {
+        int ancho = panelHistorial.Width;
+        int alto = panelHistorial.Height;
+        int total = historial.Count;
+        int barraAncho = ancho / total;
+
+        int maxValor = 1;
+        foreach (int v in historial)
+            if (v > maxValor) maxValor = v;
+
+        for (int i = 0; i < total; i++)
+        {
+            int valor = historial[i];
+            int barraAlto = (int)((valor / (float)maxValor) * (alto - 45));
+            if (barraAlto < 2) barraAlto = 2;
+
+            int x = i * barraAncho + 5;
+            int y = alto - barraAlto - 25;
+
+            Rectangle rect = new Rectangle(
+                x,
+                y,
+                barraAncho - 10,
+                barraAlto
+            );
+
+            e.Graphics.FillRectangle(Brushes.SteelBlue, rect);
+            e.Graphics.DrawRectangle(Pens.Black, rect);
+
+            e.Graphics.DrawString(
+                valor.ToString(),
+                Font,
+                Brushes.Black,
+                x,
+                y - 15
+            );
+
+            string hora = (HORA_INICIO + i).ToString("D2");
+            e.Graphics.DrawString(
+                hora,
+                Font,
+                Brushes.Black,
+                x,
+                alto - 18
+            );
+        }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        UnhookWindowsHookEx(hookID);
+        base.OnFormClosed(e);
+    }
+
+    static IntPtr SetHook(LowLevelKeyboardProc p)
+    {
+        return SetWindowsHookEx(13, p, IntPtr.Zero, 0);
+    }
+
+    delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr w, IntPtr l);
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.Run(new EscanerForm());
+    }
+
+    [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, LowLevelKeyboardProc p, IntPtr h, uint t);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int n, IntPtr w, IntPtr l);
+}
+"@
+
+# ARRANCAR
+[EscanerForm]::Main()
