@@ -131,7 +131,7 @@ public class EscanerForm : Form
         {
             Width = ANCHO_COMPLETO;
             Height = ALTO_GRAFICO;
-            btnGrafico.Text = "Ocultar gráfico";
+            btnGrafico.Text = "Ocultar grafico";
         }
         else
         {
