@@ -1,0 +1,75 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+
+public static class Native {
+    [DllImport("user32.dll")]
+    public static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")]
+    public static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);
+
+    public const int MOUSEEVENTF_LEFTDOWN = 0x02;
+    public const int MOUSEEVENTF_LEFTUP   = 0x04;
+}
+"@
+
+function Test-KeyDown([int]$vk) {
+    return (([Native]::GetAsyncKeyState($vk) -band 0x8000) -ne 0)
+}
+
+Write-Host "Script activo"
+Write-Host "→ Flecha DERECHA: ejecuta TAB, ENTER, ENTER, ALT+F4 y CLICK en (754,510)"
+Write-Host "ESC: salir"
+
+# Config
+$clickX = 1058
+$clickY = 53
+
+$VK_RIGHT  = 0x27
+$VK_ESCAPE = 0x1B
+
+while ($true) {
+
+    if (Test-KeyDown $VK_ESCAPE) {
+        Write-Host "Saliendo..."
+        break
+    }
+
+    if (Test-KeyDown $VK_RIGHT) {
+
+        Write-Host "Accion ejecutada"
+
+        # TAB
+        [System.Windows.Forms.SendKeys]::SendWait("{TAB}")
+        Start-Sleep -Milliseconds 80
+
+        # ENTER
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+        Start-Sleep -Milliseconds 80
+
+        # ENTER
+        [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+        Start-Sleep -Milliseconds 120
+
+        # ALT+F4
+        [System.Windows.Forms.SendKeys]::SendWait("%{F4}")
+        Start-Sleep -Milliseconds 200
+
+        # CLICK en X,Y
+        [System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point($clickX, $clickY)
+        Start-Sleep -Milliseconds 30
+        [Native]::mouse_event([Native]::MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        Start-Sleep -Milliseconds 30
+        [Native]::mouse_event([Native]::MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+
+        # Evitar repetir si mantienes presionada la flecha
+        while (Test-KeyDown $VK_RIGHT) { Start-Sleep -Milliseconds 20 }
+        Start-Sleep -Milliseconds 80
+    }
+
+    Start-Sleep -Milliseconds 10
+}
