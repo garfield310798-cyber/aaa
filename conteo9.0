@@ -2,7 +2,7 @@
 # CONTADOR DE ESCANEOS + ACC
 # Vista compacta / expandible
 # PowerShell 5.1 compatible
-# ================================
+# ===============================
 
 Add-Type @"
 using System;
