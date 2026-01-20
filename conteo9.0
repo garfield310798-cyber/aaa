@@ -1,0 +1,578 @@
+# ================================
+# CONTADOR DE ESCANEOS + ACC
+# Vista compacta / expandible
+# PowerShell 5.1 compatible
+# ================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Console {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32Console]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32Console]::ShowWindow($h, 0) }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using System.Drawing;
+using System.Text.RegularExpressions;
+using System.IO;
+
+public class EscanerForm : Form
+{
+    Label lblEscaneos;
+    Label lblTiempo;
+    ComboBox cboModo;
+    Button btnGrafico;
+    Button btnRestar;
+
+    // Botones guardar/cargar/eliminar
+    Button btnGuardar;
+    Button btnCargar;
+    Button btnEliminar;
+
+    Panel panelHistorial;
+    Timer timer;
+
+    static int contador = 0;
+    static string buffer = "";
+    static bool ultimoFueECOM = false;
+
+    static IntPtr hookID = IntPtr.Zero;
+    static LowLevelKeyboardProc proc = HookCallback;
+
+    List<int> historial = new List<int>();
+    bool graficoVisible = false;
+    int ultimaHora;
+
+    const int HORA_INICIO = 4;
+    const int HORA_FIN = 14;
+
+    const int ANCHO_COMPACTO = 210;
+    const int ANCHO_COMPLETO = 420;
+    const int ALTO_COMPACTO = 260;
+    const int ALTO_GRAFICO = 340;
+
+    // Ruta del TXT (sin permisos admin)
+    static readonly string CarpetaDatos =
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "EscanerContador");
+    static readonly string ArchivoDatos = Path.Combine(CarpetaDatos, "conteo.txt");
+
+    // ==========================
+    // ACC (Flecha derecha)
+    // ==========================
+    const int VK_RIGHT  = 0x27;
+    const int VK_ESCAPE = 0x1B;
+
+    // Coordenadas del click ACC
+    const int ACC_CLICK_X = 754;
+    const int ACC_CLICK_Y = 510;
+
+    bool accEnEjecucion = false;     // anti doble disparo
+    DateTime accUltimoDisparo = DateTime.MinValue;
+
+    public EscanerForm()
+    {
+        Text = "Contador";
+        Width = ANCHO_COMPACTO;
+        Height = ALTO_COMPACTO;
+        TopMost = true;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        cboModo = new ComboBox();
+        cboModo.Items.AddRange(new string[] { "Retail", "ECOM" });
+        cboModo.SelectedIndex = 0;
+        cboModo.Dock = DockStyle.Top;
+
+        lblEscaneos = new Label();
+        lblEscaneos.Text = "0";
+        lblEscaneos.Font = new Font("Arial", 28, FontStyle.Bold);
+        lblEscaneos.Dock = DockStyle.Top;
+        lblEscaneos.TextAlign = ContentAlignment.MiddleCenter;
+        lblEscaneos.Height = 60;
+
+        lblTiempo = new Label();
+        lblTiempo.Dock = DockStyle.Top;
+        lblTiempo.Height = 22;
+        lblTiempo.TextAlign = ContentAlignment.MiddleCenter;
+
+        btnGrafico = new Button();
+        btnGrafico.Text = "Mostrar grafico";
+        btnGrafico.Dock = DockStyle.Top;
+        btnGrafico.Click += ToggleGrafico;
+
+        btnRestar = new Button();
+        btnRestar.Text = "Restar 1";
+        btnRestar.Dock = DockStyle.Top;
+        btnRestar.Click += delegate {
+            if (contador > 0) contador--;
+            lblEscaneos.Text = contador.ToString();
+        };
+
+        btnGuardar = new Button();
+        btnGuardar.Text = "Guardar";
+        btnGuardar.Dock = DockStyle.Top;
+        btnGuardar.Click += delegate { GuardarDatos(); };
+
+        btnCargar = new Button();
+        btnCargar.Text = "Cargar";
+        btnCargar.Dock = DockStyle.Top;
+        btnCargar.Click += delegate { CargarDatos(); };
+
+        btnEliminar = new Button();
+        btnEliminar.Text = "Eliminar TXT";
+        btnEliminar.Dock = DockStyle.Top;
+        btnEliminar.Click += delegate { EliminarDatos(); };
+
+        panelHistorial = new Panel();
+        panelHistorial.Dock = DockStyle.Fill;
+        panelHistorial.Visible = false;
+        panelHistorial.Paint += DibujarHistorial;
+
+        Controls.Add(panelHistorial);
+
+        Controls.Add(btnEliminar);
+        Controls.Add(btnCargar);
+        Controls.Add(btnGuardar);
+
+        Controls.Add(btnRestar);
+        Controls.Add(btnGrafico);
+        Controls.Add(lblTiempo);
+        Controls.Add(lblEscaneos);
+        Controls.Add(cboModo);
+
+        for (int h = HORA_INICIO; h <= HORA_FIN; h++)
+            historial.Add(0);
+
+        ultimaHora = DateTime.Now.Hour;
+
+        hookID = SetHook(proc);
+
+        timer = new Timer();
+        timer.Interval = 50; // tick rapido para leer tecla derecha + actualizar tiempo
+        timer.Tick += Tick;
+        timer.Start();
+    }
+
+    void ToggleGrafico(object s, EventArgs e)
+    {
+        graficoVisible = !graficoVisible;
+        panelHistorial.Visible = graficoVisible;
+
+        if (graficoVisible)
+        {
+            Width = ANCHO_COMPLETO;
+            Height = ALTO_GRAFICO;
+            btnGrafico.Text = "Ocultar grafico";
+        }
+        else
+        {
+            Width = ANCHO_COMPACTO;
+            Height = ALTO_COMPACTO;
+            btnGrafico.Text = "Mostrar grafico";
+        }
+    }
+
+    void Tick(object s, EventArgs e)
+    {
+        // --------- TIEMPO (una vez por segundo aprox) ----------
+        // Como el timer esta en 50ms, controlamos que el texto se actualice sin sobrecargar
+        if ((DateTime.Now.Millisecond < 60))
+        {
+            DateTime ahora = DateTime.Now;
+            DateTime siguiente = new DateTime(
+                ahora.Year, ahora.Month, ahora.Day,
+                ahora.Hour, 0, 0).AddHours(1);
+
+            TimeSpan restante = siguiente - ahora;
+            lblTiempo.Text = "Proximo corte en " +
+                restante.Minutes.ToString("D2") + ":" +
+                restante.Seconds.ToString("D2");
+
+            if (ahora.Hour != ultimaHora)
+            {
+                int idx = ultimaHora - HORA_INICIO;
+                if (idx >= 0 && idx < historial.Count)
+                    historial[idx] = contador;
+
+                contador = 0;
+                lblEscaneos.Text = "0";
+                panelHistorial.Invalidate();
+                ultimaHora = ahora.Hour;
+            }
+        }
+
+        // --------- ACC: Flecha derecha ----------
+        // Anti-repeticion: disparar una vez por pulsacion
+        bool rightDown = (GetAsyncKeyState(VK_RIGHT) & 0x8000) != 0;
+
+        if (rightDown && !accEnEjecucion)
+        {
+            // Debounce adicional por si el teclado repite
+            if ((DateTime.Now - accUltimoDisparo).TotalMilliseconds > 250)
+            {
+                accEnEjecucion = true;
+                accUltimoDisparo = DateTime.Now;
+
+                EjecutarACC();
+
+                // liberar despues de la secuencia
+                accEnEjecucion = false;
+            }
+        }
+        else if (!rightDown)
+        {
+            accEnEjecucion = false;
+        }
+    }
+
+    void EjecutarACC()
+    {
+        try
+        {
+            // TAB
+            SendKeys.SendWait("{TAB}");
+            System.Threading.Thread.Sleep(80);
+
+            // ENTER
+            SendKeys.SendWait("{ENTER}");
+            System.Threading.Thread.Sleep(80);
+
+            // ENTER
+            SendKeys.SendWait("{ENTER}");
+            System.Threading.Thread.Sleep(120);
+
+            // ALT+F4
+            SendKeys.SendWait("%{F4}");
+            System.Threading.Thread.Sleep(200);
+
+            // CLICK en X,Y
+            Cursor.Position = new Point(ACC_CLICK_X, ACC_CLICK_Y);
+            System.Threading.Thread.Sleep(30);
+            mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0);
+            System.Threading.Thread.Sleep(30);
+            mouse_event(MOUSEEVENTF_LEFTUP, 0, 0, 0, 0);
+        }
+        catch
+        {
+            // Silencioso para no molestar la app
+        }
+    }
+
+    static bool EsNumerico(string s)
+    {
+        return Regex.IsMatch(s, @"^\d{8,15}$");
+    }
+
+    static bool EsECOM(string s)
+    {
+        return Regex.IsMatch(s, @"^[A-Z]{2}-\d{4}$");
+    }
+
+    static void Procesar(string txt)
+    {
+        if (string.IsNullOrEmpty(txt)) return;
+
+        EscanerForm f = (EscanerForm)Application.OpenForms[0];
+        bool sumar = false;
+
+        if (f.cboModo.Text == "Retail")
+        {
+            if (EsNumerico(txt)) sumar = true;
+        }
+        else
+        {
+            if (EsECOM(txt))
+            {
+                sumar = true;
+                ultimoFueECOM = true;
+            }
+            else if (EsNumerico(txt))
+            {
+                sumar = true;
+                if (ultimoFueECOM) contador--;
+                ultimoFueECOM = false;
+            }
+            else ultimoFueECOM = false;
+        }
+
+        if (sumar)
+        {
+            contador++;
+            f.BeginInvoke((Action)delegate {
+                f.lblEscaneos.Text = contador.ToString();
+            });
+        }
+    }
+
+    static IntPtr HookCallback(int nCode, IntPtr w, IntPtr l)
+    {
+        if (nCode >= 0 && w == (IntPtr)0x0100) // WM_KEYDOWN
+        {
+            int k = Marshal.ReadInt32(l);
+            if (k >= 48 && k <= 57) buffer += (char)k;
+            else if (k >= 65 && k <= 90) buffer += (char)k;
+            else if (k == 189) buffer += "-";
+            else if (k == 13 || k == 9)
+            {
+                Procesar(buffer);
+                buffer = "";
+            }
+            else buffer = "";
+        }
+        return CallNextHookEx(hookID, nCode, w, l);
+    }
+
+    void DibujarHistorial(object s, PaintEventArgs e)
+    {
+        int ancho = panelHistorial.Width;
+        int alto = panelHistorial.Height;
+        int total = historial.Count;
+        int barraAncho = ancho / Math.Max(1, total);
+
+        int maxValor = 1;
+        foreach (int v in historial)
+            if (v > maxValor) maxValor = v;
+
+        for (int i = 0; i < total; i++)
+        {
+            int valor = historial[i];
+            int barraAlto = (int)((valor / (float)maxValor) * (alto - 45));
+            if (barraAlto < 2) barraAlto = 2;
+
+            int x = i * barraAncho + 5;
+            int y = alto - barraAlto - 25;
+
+            e.Graphics.FillRectangle(Brushes.SteelBlue, x, y, barraAncho - 10, barraAlto);
+            e.Graphics.DrawRectangle(Pens.Black, x, y, barraAncho - 10, barraAlto);
+
+            e.Graphics.DrawString(valor.ToString(), Font, Brushes.Black, x, y - 15);
+            e.Graphics.DrawString((HORA_INICIO + i).ToString("D2"), Font, Brushes.Black, x, alto - 18);
+        }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        UnhookWindowsHookEx(hookID);
+        base.OnFormClosed(e);
+    }
+
+    static IntPtr SetHook(LowLevelKeyboardProc p)
+    {
+        return SetWindowsHookEx(13, p, IntPtr.Zero, 0);
+    }
+
+    delegate IntPtr LowLevelKeyboardProc(int nCode, IntPtr w, IntPtr l);
+
+    // ==========================
+    // Guardar / Cargar / Eliminar TXT
+    // ==========================
+    void GuardarDatos()
+    {
+        try
+        {
+            Directory.CreateDirectory(CarpetaDatos);
+
+            string modo = cboModo.Text;
+            int c = contador;
+            int horaGuardado = DateTime.Now.Hour;
+            int uh = ultimaHora;
+            string hist = string.Join(",", historial);
+
+            File.WriteAllLines(ArchivoDatos, new string[] {
+                modo,
+                c.ToString(),
+                horaGuardado.ToString(),
+                uh.ToString(),
+                hist
+            });
+
+            MessageBox.Show(
+                "Datos guardados correctamente.\n\nArchivo:\n" + ArchivoDatos,
+                "Guardar",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "Error al guardar los datos.\n\n" + ex.Message,
+                "Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+        }
+    }
+
+    void CargarDatos()
+    {
+        try
+        {
+            if (!File.Exists(ArchivoDatos))
+            {
+                MessageBox.Show(
+                    "No existe ningun archivo guardado.\n\n" + ArchivoDatos,
+                    "Cargar",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning
+                );
+                return;
+            }
+
+            string[] lineas = File.ReadAllLines(ArchivoDatos);
+            if (lineas.Length < 5)
+            {
+                MessageBox.Show(
+                    "El archivo esta incompleto o dañado.",
+                    "Cargar",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error
+                );
+                return;
+            }
+
+            string modo = lineas[0].Trim();
+            int contadorGuardado = int.Parse(lineas[1]);
+            int horaGuardado = int.Parse(lineas[2]);
+
+            string[] parts = lineas[4].Split(',');
+
+            cboModo.SelectedIndex = (modo == "ECOM") ? 1 : 0;
+
+            historial.Clear();
+            foreach (string p in parts)
+            {
+                int v = 0;
+                int.TryParse(p, out v);
+                historial.Add(v);
+            }
+
+            if (historial.Count == 0)
+            {
+                for (int h = HORA_INICIO; h <= HORA_FIN; h++)
+                    historial.Add(0);
+            }
+
+            bool mismaHora = (DateTime.Now.Hour == horaGuardado);
+
+            if (mismaHora)
+            {
+                contador = contadorGuardado;
+            }
+            else
+            {
+                int idx = horaGuardado - HORA_INICIO;
+                if (idx >= 0 && idx < historial.Count)
+                    historial[idx] = contadorGuardado;
+
+                contador = 0;
+            }
+
+            lblEscaneos.Text = contador.ToString();
+            ultimaHora = DateTime.Now.Hour;
+            panelHistorial.Invalidate();
+
+            MessageBox.Show(
+                mismaHora
+                    ? "Datos cargados.\n\nContador restaurado."
+                    : "Datos cargados.\n\nEl contador se reinicio porque corresponde a otra hora.",
+                "Cargar",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information
+            );
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "Error al cargar los datos.\n\n" + ex.Message,
+                "Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+        }
+    }
+
+    void EliminarDatos()
+    {
+        try
+        {
+            if (!File.Exists(ArchivoDatos))
+            {
+                MessageBox.Show(
+                    "No hay ningun archivo para eliminar.",
+                    "Eliminar",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning
+                );
+                return;
+            }
+
+            DialogResult r = MessageBox.Show(
+                "¿Seguro que deseas eliminar el archivo de datos?\n\n" + ArchivoDatos,
+                "Confirmar eliminacion",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question
+            );
+
+            if (r == DialogResult.Yes)
+            {
+                File.Delete(ArchivoDatos);
+
+                MessageBox.Show(
+                    "Archivo eliminado correctamente.",
+                    "Eliminar",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information
+                );
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show(
+                "Error al eliminar el archivo.\n\n" + ex.Message,
+                "Error",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Error
+            );
+        }
+    }
+
+    // ==========================
+    // Main
+    // ==========================
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new EscanerForm());
+    }
+
+    // Hooks + ACC imports
+    [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int id, LowLevelKeyboardProc p, IntPtr h, uint t);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr h, int n, IntPtr w, IntPtr l);
+
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);
+
+    [DllImport("user32.dll")] static extern void mouse_event(int dwFlags, int dx, int dy, int dwData, int dwExtraInfo);
+    const int MOUSEEVENTF_LEFTDOWN = 0x02;
+    const int MOUSEEVENTF_LEFTUP   = 0x04;
+}
+"@
+
+# ARRANCAR
+[EscanerForm]::Main()
