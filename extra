@@ -1,0 +1,127 @@
+# ====================================================================
+# SCRIPT DE AUTOMATIZACIÓN DE INTERFAZ (BASADO EN SCRIPT DE CONTEO)
+# Utiliza GetAsyncKeyState en un temporizador para evitar bloqueos
+# ====================================================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Console {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32Console]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32Console]::ShowWindow($h, 0) }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Windows.Forms;
+using System.Runtime.InteropServices;
+using System.Drawing;
+
+public class AutoForm : Form
+{
+    private Timer timer;
+    private bool leftEnEjecucion = false;
+    private DateTime leftUltimoDisparo = DateTime.MinValue;
+
+    // Código de la tecla flecha izquierda (Misma que usa tu script de conteo)
+    private const int VK_LEFT = 0x25;
+
+    public AutoForm()
+    {
+        // Crear una interfaz pequeña idéntica en comportamiento a la de conteo
+        Text = "Auto Key";
+        Width = 200;
+        Height = 100;
+        TopMost = true;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        Label lblStatus = new Label();
+        lblStatus.Text = "Escuchando Flecha Izq...";
+        lblStatus.Dock = DockStyle.Fill;
+        lblStatus.TextAlign = ContentAlignment.MiddleCenter;
+        Controls.Add(lblStatus);
+
+        // Inicializar el temporizador con el mismo intervalo de tu script (50ms)
+        timer = new Timer();
+        timer.Interval = 50;
+        timer.Tick += Tick;
+        timer.Start();
+    }
+
+    private void Tick(object sender, EventArgs e)
+    {
+        // Detección de tecla usando GetAsyncKeyState (Mismo método de tu script de conteo)
+        bool leftDown = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
+        
+        if (leftDown && !leftEnEjecucion)
+        {
+            // Control de tiempo para evitar ejecuciones repetidas ráfaga (250ms)
+            if ((DateTime.Now - leftUltimoDisparo).TotalMilliseconds > 250)
+            {
+                leftEnEjecucion = true;
+                leftUltimoDisparo = DateTime.Now;
+                
+                EjecutarSecuenciaTeclas();
+                
+                leftEnEjecucion = false;
+            }
+        }
+        else if (!leftDown) 
+        {
+            leftEnEjecucion = false;
+        }
+    }
+
+    private void EjecutarSecuenciaTeclas()
+    {
+        try
+        {
+            // 1. CTRL + A (Seleccionar todo)
+            SendKeys.SendWait("^a");
+            System.Threading.Thread.Sleep(100);
+
+            // 2. CTRL + X (Cortar)
+            SendKeys.SendWait("^x");
+            System.Threading.Thread.Sleep(100);
+
+            // 3. ALT + TAB (Cambiar de ventana)
+            SendKeys.SendWait("%{TAB}");
+            System.Threading.Thread.Sleep(250); // Pausa ligeramente mayor para permitir el cambio de ventana
+
+            // 4. CTRL + V (Pegar)
+            SendKeys.SendWait("^v");
+            System.Threading.Thread.Sleep(100);
+
+            // 5. ENTER (Ejecutar/Confirmar)
+            SendKeys.SendWait("{ENTER}");
+            System.Threading.Thread.Sleep(100);
+
+            // 6. ALT + TAB (Regresar a la ventana original)
+            SendKeys.SendWait("%{TAB}");
+        }
+        catch { }
+    }
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new AutoForm());
+    }
+
+    // Declaración nativa idéntica a tu script original
+    [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+}
+"@
+
+[AutoForm]::Main()
