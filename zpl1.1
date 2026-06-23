@@ -16,8 +16,8 @@ $Enc = [System.Text.Encoding]::GetEncoding(28591)   # Latin1: preserva bytes del
 $script:elementos = New-Object System.Collections.ArrayList
 $script:selected  = $null
 $script:scale     = 1.0
-$script:labelW    = 609      # ancho de la etiqueta en dots (203dpi: 3" = 609)
-$script:labelH    = 406      # alto  de la etiqueta en dots (203dpi: 2" = 406)
+$script:labelW    = 812      # ancho de la etiqueta en dots (4" x 203dpi = 812)
+$script:labelH    = 1218     # alto  de la etiqueta en dots (6" x 203dpi = 1218)
 $script:dragging  = $false
 $script:dragOffX  = 0
 $script:dragOffY  = 0
@@ -203,9 +203,9 @@ function Select-Elemento($el) {
 function New-Elemento($tipo) {
     $el = @{ Type = $tipo; X = 20; Y = 20; Text = ""; Height = 30; Module = 2; ShowText = $true; Ctrl = $null }
     switch ($tipo) {
-        "Texto"   { $el.Text = "Texto";              $el.Height = 30 }
-        "Barcode" { $el.Text = "123456789";          $el.Height = 80; $el.Module = 2 }
-        "QR"      { $el.Text = "https://ejemplo.com"; $el.Height = 120; $el.Module = 5 }
+        "Texto"   { $el.Text = "Texto";              $el.Height = 45 }
+        "Barcode" { $el.Text = "123456789";          $el.Height = 140; $el.Module = 3 }
+        "QR"      { $el.Text = "https://ejemplo.com"; $el.Height = 200; $el.Module = 6 }
     }
     if ($tipo -eq "Texto") {
         $c = New-Object System.Windows.Forms.Label
@@ -317,6 +317,20 @@ $btnTam.Text = "Aplicar tamano"
 $btnTam.Location = New-Object System.Drawing.Point(290, 8)
 $btnTam.Size = New-Object System.Drawing.Size(100, 25)
 $tabDiseno.Controls.Add($btnTam)
+
+$lblPreset = New-Object System.Windows.Forms.Label
+$lblPreset.Text = "Preset:"
+$lblPreset.Location = New-Object System.Drawing.Point(396, 12)
+$lblPreset.Size = New-Object System.Drawing.Size(42, 18)
+$tabDiseno.Controls.Add($lblPreset)
+
+$cboPreset = New-Object System.Windows.Forms.ComboBox
+$cboPreset.DropDownStyle = "DropDownList"
+$cboPreset.Items.AddRange(@("4x6 203", "4x6 300", "3x2 203", "2x1 203"))
+$cboPreset.SelectedIndex = 0
+$cboPreset.Location = New-Object System.Drawing.Point(440, 9)
+$cboPreset.Size = New-Object System.Drawing.Size(80, 22)
+$tabDiseno.Controls.Add($cboPreset)
 
 # Lienzo
 $script:panelCanvas = New-Object System.Windows.Forms.Panel
@@ -539,11 +553,24 @@ function Escribir-Log([string]$msg) {
 # ============================================================
 $btnTam.Add_Click({
     $w = 0; $h = 0
-    if (-not [int]::TryParse($txtW.Text.Trim(), [ref]$w) -or $w -lt 50) { $w = 609 }
-    if (-not [int]::TryParse($txtH.Text.Trim(), [ref]$h) -or $h -lt 50) { $h = 406 }
+    if (-not [int]::TryParse($txtW.Text.Trim(), [ref]$w) -or $w -lt 50) { $w = 812 }
+    if (-not [int]::TryParse($txtH.Text.Trim(), [ref]$h) -or $h -lt 50) { $h = 1218 }
     $script:labelW = $w
     $script:labelH = $h
     $txtW.Text = "$w"; $txtH.Text = "$h"
+    Recalcular-Scale
+    foreach ($el in $script:elementos) { Refresh-Control $el }
+})
+
+$cboPreset.Add_SelectedIndexChanged({
+    switch ($cboPreset.SelectedItem) {
+        "4x6 203" { $script:labelW = 812;  $script:labelH = 1218 }
+        "4x6 300" { $script:labelW = 1200; $script:labelH = 1800 }
+        "3x2 203" { $script:labelW = 609;  $script:labelH = 406 }
+        "2x1 203" { $script:labelW = 406;  $script:labelH = 203 }
+    }
+    $txtW.Text = "$script:labelW"
+    $txtH.Text = "$script:labelH"
     Recalcular-Scale
     foreach ($el in $script:elementos) { Refresh-Control $el }
 })
