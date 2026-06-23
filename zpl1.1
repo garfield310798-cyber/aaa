@@ -1,7 +1,10 @@
 # ============================================================
 # DISENADOR DE ETIQUETAS ZPL
 #powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "%USERPROFILE%\Desktop\zpl.ps1"
-# Texto + Code128 REAL + QR + Emoji (bitmap ^GFA)
+# ============================================================
+# DISENADOR DE ETIQUETAS ZPL
+# Texto + Parrafo (multilinea) + Code128 REAL + QR + Emoji (^GFA)
+# Cuadricula de alineacion, escalonado anti-solape y limpiar todo.
 # Hoja por defecto 4x6 pulgadas (203 dpi).  PowerShell 5.1, sin instalar nada.
 # ============================================================
 
@@ -22,6 +25,8 @@ $script:labelH    = 1218     # 6" x 203dpi
 $script:dragging  = $false
 $script:dragOffX  = 0
 $script:dragOffY  = 0
+$script:snap      = $false
+$script:gridDots  = 20
 
 # ------------------------------------------------------------
 #  TABLA DE PATRONES CODE128 (valor 0..106 -> anchos de modulos)
@@ -235,11 +240,16 @@ $OnMouseMove = {
         if ($nt -lt 0) { $nt = 0 }
         if ($nl -gt ($script:panelCanvas.Width  - $s.Width))  { $nl = $script:panelCanvas.Width  - $s.Width }
         if ($nt -gt ($script:panelCanvas.Height - $s.Height)) { $nt = $script:panelCanvas.Height - $s.Height }
-        $s.Left = $nl
-        $s.Top  = $nt
         $el = $s.Tag
         $el.X = [int]($nl / $script:scale)
         $el.Y = [int]($nt / $script:scale)
+        if ($script:snap) {
+            $gd = $script:gridDots
+            $el.X = [int]([Math]::Round($el.X / $gd) * $gd)
+            $el.Y = [int]([Math]::Round($el.Y / $gd) * $gd)
+        }
+        $s.Left = [int]($el.X * $script:scale)
+        $s.Top  = [int]($el.Y * $script:scale)
         $script:lblPos.Text = "X: $($el.X)  Y: $($el.Y) dots"
     }
 }
@@ -267,6 +277,15 @@ function Refresh-Control($el) {
         $pt = [Math]::Round($el.Height * $script:scale * 0.75)
         if ($pt -lt 6) { $pt = 6 }
         $c.Font = New-Object System.Drawing.Font("Arial", $pt, [System.Drawing.FontStyle]::Bold)
+        $c.Text = $el.Text
+    }
+    elseif ($el.Type -eq "Parrafo") {
+        $pt = [Math]::Round($el.Height * $script:scale * 0.75)
+        if ($pt -lt 6) { $pt = 6 }
+        $bw = [int]($el.BlockW * $script:scale)
+        if ($bw -lt 30) { $bw = 30 }
+        $c.Font = New-Object System.Drawing.Font("Arial", $pt)
+        $c.MaximumSize = New-Object System.Drawing.Size($bw, 0)
         $c.Text = $el.Text
     }
     elseif ($el.Type -eq "Barcode") {
@@ -308,10 +327,14 @@ function Select-Elemento($el) {
         $script:txtContenido.Text  = $el.Text
         $script:numAltura.Value    = [decimal]([Math]::Max(1, [Math]::Min(2000, $el.Height)))
         $script:numModulo.Value    = [decimal]([Math]::Max(1, [Math]::Min(10,   $el.Module)))
+        $bw = 400
+        if ($el.ContainsKey("BlockW")) { $bw = $el.BlockW }
+        $script:numAncho.Value     = [decimal]([Math]::Max(50, [Math]::Min(2000, $bw)))
         $script:chkMostrar.Checked = [bool]$el.ShowText
         $script:lblTipoSel.Text    = "Seleccionado: $($el.Type)"
         $script:chkMostrar.Enabled = ($el.Type -eq "Barcode")
         $script:numModulo.Enabled  = ($el.Type -eq "Barcode" -or $el.Type -eq "QR")
+        $script:numAncho.Enabled   = ($el.Type -eq "Parrafo")
     }
     else {
         $script:lblTipoSel.Text = "Seleccionado: (ninguno)"
@@ -319,14 +342,21 @@ function Select-Elemento($el) {
 }
 
 function New-Elemento($tipo) {
-    $el = @{ Type = $tipo; X = 20; Y = 20; Text = ""; Height = 45; Module = 2; ShowText = $true; Ctrl = $null }
+    $el = @{ Type = $tipo; X = 20; Y = 20; Text = ""; Height = 45; Module = 2; ShowText = $true; BlockW = 400; Ctrl = $null }
     switch ($tipo) {
         "Texto"   { $el.Text = "Texto";              $el.Height = 45 }
+        "Parrafo" { $el.Text = "Linea 1`r`nLinea 2`r`nLinea 3"; $el.Height = 32; $el.BlockW = 500 }
         "Barcode" { $el.Text = "123456789";          $el.Height = 140; $el.Module = 3 }
         "QR"      { $el.Text = "https://ejemplo.com"; $el.Height = 200; $el.Module = 6 }
         "Emoji"   { $el.Text = [char]::ConvertFromUtf32(0x2B50); $el.Height = 150 }  # estrella por defecto
     }
-    if ($tipo -eq "Texto") {
+    # Escalonar la posicion para no solapar los componentes nuevos
+    $i = $script:elementos.Count
+    $rangoX = [Math]::Max(40, ($script:labelW - 80))
+    $rangoY = [Math]::Max(40, ($script:labelH - 80))
+    $el.X = 20 + [int](($i * 25) % $rangoX)
+    $el.Y = 20 + [int](($i * 40) % $rangoY)
+    if ($tipo -eq "Texto" -or $tipo -eq "Parrafo") {
         $c = New-Object System.Windows.Forms.Label
         $c.AutoSize  = $true
         $c.BackColor = [System.Drawing.Color]::White
@@ -371,12 +401,15 @@ function Show-EmojiPicker {
     $script:emojiPick = $null
 
     $cats = @(
-        @{ N = "Caras"; C = @(0x1F600,0x1F603,0x1F604,0x1F601,0x1F606,0x1F605,0x1F923,0x1F602,0x1F642,0x1F609,0x1F60A,0x1F60D,0x1F618,0x1F60E,0x1F914,0x1F610,0x1F62E,0x1F62D,0x1F621,0x1F631,0x1F973,0x1F60B,0x1F644,0x1F634,0x1F920,0x1F62C,0x1F971,0x1F913) },
-        @{ N = "Manos"; C = @(0x1F44D,0x1F44E,0x1F44C,0x1F44F,0x1F64C,0x1F64F,0x1F4AA,0x270B,0x1F44B,0x270C,0x1F91D,0x261D,0x1F446,0x1F447,0x1F448,0x1F449,0x1F44A,0x1F918) },
-        @{ N = "Corazones / estrellas"; C = @(0x2764,0x1F9E1,0x1F49B,0x1F49A,0x1F499,0x1F49C,0x1F5A4,0x1F494,0x2B50,0x1F31F,0x2728,0x1F525,0x1F4A5,0x1F4AF,0x1F389,0x1F388) },
-        @{ N = "Marcas / avisos"; C = @(0x2705,0x274C,0x2714,0x2716,0x2757,0x2753,0x26A0,0x1F6AB,0x1F4CC,0x1F4CD,0x1F511,0x1F512,0x1F513,0x1F50D,0x1F4A1,0x2699) },
-        @{ N = "Flechas"; C = @(0x2B06,0x2B07,0x2B05,0x27A1,0x2197,0x2198,0x2199,0x2196,0x21A9,0x21AA,0x1F501,0x1F504) },
-        @{ N = "Envio / objetos"; C = @(0x1F4E6,0x1F69A,0x2708,0x1F6D2,0x1F4B0,0x1F4B5,0x1F3F7,0x1F4CB,0x1F4C5,0x1F4C8,0x1F381,0x1F4F1,0x1F4BB,0x1F527,0x1F528,0x1F4E7) }
+        @{ N = "Caras"; C = @(0x1F600,0x1F603,0x1F604,0x1F601,0x1F606,0x1F605,0x1F923,0x1F602,0x1F642,0x1F643,0x1F609,0x1F60A,0x1F607,0x1F60D,0x1F929,0x1F618,0x1F617,0x1F61A,0x1F60B,0x1F61B,0x1F61C,0x1F92A,0x1F60E,0x1F913,0x1F9D0,0x1F914,0x1F910,0x1F928,0x1F610,0x1F611,0x1F636,0x1F644,0x1F62C,0x1F925,0x1F60F,0x1F612,0x1F614,0x1F61E,0x1F623,0x1F622,0x1F62D,0x1F631,0x1F628,0x1F630,0x1F975,0x1F976,0x1F924,0x1F621,0x1F620,0x1F92C,0x1F634,0x1F62A,0x1F971,0x1F973,0x1F979,0x1F970,0x1F60C) },
+        @{ N = "Manos"; C = @(0x1F44D,0x1F44E,0x1F44C,0x1F90C,0x1F90F,0x270C,0x1F91E,0x1F91F,0x1F918,0x1F919,0x1F448,0x1F449,0x1F446,0x1F447,0x261D,0x1F595,0x270B,0x1F44B,0x1F91A,0x1F596,0x1F590,0x1F44F,0x1F64C,0x1F450,0x1F932,0x1F91D,0x1F64F,0x1F4AA,0x1F44A,0x270A,0x1F91B,0x1F91C) },
+        @{ N = "Corazones / estrellas"; C = @(0x2764,0x1F9E1,0x1F49B,0x1F49A,0x1F499,0x1F49C,0x1F90E,0x1F5A4,0x1F90D,0x1F494,0x2763,0x1F495,0x1F49E,0x1F493,0x1F497,0x1F496,0x1F498,0x1F49D,0x2B50,0x1F31F,0x2728,0x1F4AB,0x1F525,0x1F4A5,0x1F4A2,0x1F4AF,0x1F389,0x1F38A,0x1F388) },
+        @{ N = "Marcas / avisos"; C = @(0x2705,0x2714,0x274C,0x274E,0x2716,0x2795,0x2796,0x2797,0x2757,0x2755,0x2753,0x2754,0x26A0,0x1F6AB,0x26D4,0x1F4DB,0x2B55,0x267B,0x2611,0x1F4CC,0x1F4CD,0x1F511,0x1F512,0x1F513,0x1F50F,0x1F50D,0x1F50E,0x1F4A1,0x2699,0x1F3F3) },
+        @{ N = "Flechas"; C = @(0x2B06,0x2197,0x27A1,0x2198,0x2B07,0x2199,0x2B05,0x2196,0x2195,0x2194,0x21A9,0x21AA,0x2934,0x2935,0x1F503,0x1F504,0x1F500,0x1F501,0x1F502,0x25B6,0x23E9,0x23ED,0x25C0,0x23EA,0x23EE,0x23F8,0x23F9,0x23FA) },
+        @{ N = "Comida"; C = @(0x1F34E,0x1F34F,0x1F34A,0x1F34B,0x1F347,0x1F353,0x1F349,0x1F351,0x1F352,0x1F34C,0x1F34D,0x1F965,0x1F95D,0x1F345,0x1F955,0x1F33D,0x1F354,0x1F35F,0x1F355,0x1F32D,0x1F32E,0x1F32F,0x1F37F,0x1F35C,0x1F363,0x1F371,0x1F369,0x1F370,0x1F36A,0x1F36B,0x1F36D,0x2615,0x1F375,0x1F37A,0x1F377,0x1F942) },
+        @{ N = "Animales / naturaleza"; C = @(0x1F436,0x1F431,0x1F42D,0x1F439,0x1F430,0x1F98A,0x1F43B,0x1F43C,0x1F428,0x1F42F,0x1F981,0x1F42E,0x1F437,0x1F438,0x1F435,0x1F414,0x1F427,0x1F426,0x1F985,0x1F986,0x1F989,0x1F41D,0x1F98B,0x1F40C,0x1F41E,0x1F420,0x1F41F,0x1F433,0x1F40B,0x1F40D,0x1F332,0x1F333,0x1F334,0x1F335,0x1F33F,0x1F340,0x1F33B,0x1F33C,0x1F337,0x1F33A,0x1F338) },
+        @{ N = "Clima / viaje"; C = @(0x2600,0x1F31E,0x1F324,0x26C5,0x2601,0x1F325,0x1F326,0x1F327,0x26C8,0x1F329,0x1F328,0x2744,0x2603,0x26C4,0x1F308,0x1F319,0x2B50,0x1F697,0x1F695,0x1F699,0x1F68C,0x1F69A,0x1F692,0x1F693,0x1F6B2,0x2708,0x1F680,0x1F6F8,0x1F6A2,0x2693,0x1F3E0,0x1F3E2,0x1F3E5,0x1F3EB,0x1F30D) },
+        @{ N = "Simbolos"; C = @(0x00A9,0x00AE,0x2122,0x1F4B2,0x1F4B1,0x267E,0x2648,0x303D,0x2733,0x2734,0x2747,0x274E,0x1F195,0x1F197,0x1F198,0x1F199,0x1F51D,0x1F6AD,0x1F4F5,0x1F505,0x1F506,0x269C,0x1F532,0x1F533,0x25FB,0x25FC,0x1F518,0x1F534,0x1F7E0,0x1F7E1,0x1F7E2,0x1F535,0x1F7E3) }
     )
 
     $clickHandler = {
@@ -426,6 +459,13 @@ function Generar-ZPL {
             $h = [int]$el.Height
             $w = [int]($h * 0.6)
             [void]$sb.AppendLine("^FO$x,$y^A0N,$h,$w^FD$($el.Text)^FS")
+        }
+        elseif ($el.Type -eq "Parrafo") {
+            $h = [int]$el.Height
+            $w = [int]($h * 0.6)
+            $bw = [int]$el.BlockW
+            $body = ("$($el.Text)") -replace "`r`n", '\&' -replace "`n", '\&' -replace "`r", '\&'
+            [void]$sb.AppendLine("^FO$x,$y^A0N,$h,$w^FB$bw,50,0,L,0^FD$body^FS")
         }
         elseif ($el.Type -eq "Barcode") {
             $h = [int]$el.Height
@@ -528,98 +568,135 @@ $btnAddTexto.Location = New-Object System.Drawing.Point($colX, 42)
 $btnAddTexto.Size = New-Object System.Drawing.Size(115, 28)
 $tabDiseno.Controls.Add($btnAddTexto)
 
+$btnAddParrafo = New-Object System.Windows.Forms.Button
+$btnAddParrafo.Text = "+ Parrafo"
+$btnAddParrafo.Location = New-Object System.Drawing.Point($colX, 74)
+$btnAddParrafo.Size = New-Object System.Drawing.Size(115, 28)
+$tabDiseno.Controls.Add($btnAddParrafo)
+
 $btnAddBarcode = New-Object System.Windows.Forms.Button
 $btnAddBarcode.Text = "+ Codigo barras"
-$btnAddBarcode.Location = New-Object System.Drawing.Point($colX, 74)
+$btnAddBarcode.Location = New-Object System.Drawing.Point($colX, 106)
 $btnAddBarcode.Size = New-Object System.Drawing.Size(115, 28)
 $tabDiseno.Controls.Add($btnAddBarcode)
 
 $btnAddQR = New-Object System.Windows.Forms.Button
 $btnAddQR.Text = "+ QR"
-$btnAddQR.Location = New-Object System.Drawing.Point($colX, 106)
+$btnAddQR.Location = New-Object System.Drawing.Point($colX, 138)
 $btnAddQR.Size = New-Object System.Drawing.Size(115, 28)
 $tabDiseno.Controls.Add($btnAddQR)
 
 $btnAddEmoji = New-Object System.Windows.Forms.Button
 $btnAddEmoji.Text = "+ Emoji"
-$btnAddEmoji.Location = New-Object System.Drawing.Point($colX, 138)
+$btnAddEmoji.Location = New-Object System.Drawing.Point($colX, 170)
 $btnAddEmoji.Size = New-Object System.Drawing.Size(115, 28)
 $tabDiseno.Controls.Add($btnAddEmoji)
 
 $btnEliminar = New-Object System.Windows.Forms.Button
 $btnEliminar.Text = "Eliminar"
-$btnEliminar.Location = New-Object System.Drawing.Point($colX, 170)
+$btnEliminar.Location = New-Object System.Drawing.Point($colX, 202)
 $btnEliminar.Size = New-Object System.Drawing.Size(115, 28)
 $tabDiseno.Controls.Add($btnEliminar)
 
+$btnLimpiar = New-Object System.Windows.Forms.Button
+$btnLimpiar.Text = "Limpiar todo"
+$btnLimpiar.Location = New-Object System.Drawing.Point($colX, 234)
+$btnLimpiar.Size = New-Object System.Drawing.Size(115, 28)
+$tabDiseno.Controls.Add($btnLimpiar)
+
+$script:chkGrid = New-Object System.Windows.Forms.CheckBox
+$script:chkGrid.Text = "Cuadricula (alinear)"
+$script:chkGrid.Location = New-Object System.Drawing.Point($colX, 268)
+$script:chkGrid.Size = New-Object System.Drawing.Size(135, 22)
+$tabDiseno.Controls.Add($script:chkGrid)
+
 $grp = New-Object System.Windows.Forms.GroupBox
 $grp.Text = "Propiedades"
-$grp.Location = New-Object System.Drawing.Point(10, 342)
-$grp.Size = New-Object System.Drawing.Size(505, 162)
+$grp.Location = New-Object System.Drawing.Point(10, 338)
+$grp.Size = New-Object System.Drawing.Size(505, 172)
 $tabDiseno.Controls.Add($grp)
 
 $script:lblTipoSel = New-Object System.Windows.Forms.Label
 $script:lblTipoSel.Text = "Seleccionado: (ninguno)"
-$script:lblTipoSel.Location = New-Object System.Drawing.Point(12, 20)
+$script:lblTipoSel.Location = New-Object System.Drawing.Point(12, 18)
 $script:lblTipoSel.Size = New-Object System.Drawing.Size(300, 18)
 $grp.Controls.Add($script:lblTipoSel)
 
 $lblCont = New-Object System.Windows.Forms.Label
 $lblCont.Text = "Contenido:"
-$lblCont.Location = New-Object System.Drawing.Point(12, 46)
+$lblCont.Location = New-Object System.Drawing.Point(12, 44)
 $lblCont.Size = New-Object System.Drawing.Size(75, 18)
 $grp.Controls.Add($lblCont)
 
 $script:txtContenido = New-Object System.Windows.Forms.TextBox
-$script:txtContenido.Location = New-Object System.Drawing.Point(90, 43)
-$script:txtContenido.Size = New-Object System.Drawing.Size(400, 22)
+$script:txtContenido.Multiline = $true
+$script:txtContenido.AcceptsReturn = $true
+$script:txtContenido.WordWrap = $true
+$script:txtContenido.ScrollBars = "Vertical"
+$script:txtContenido.Location = New-Object System.Drawing.Point(90, 42)
+$script:txtContenido.Size = New-Object System.Drawing.Size(400, 54)
 $grp.Controls.Add($script:txtContenido)
 
 $lblAlt = New-Object System.Windows.Forms.Label
-$lblAlt.Text = "Altura (dots):"
-$lblAlt.Location = New-Object System.Drawing.Point(12, 78)
-$lblAlt.Size = New-Object System.Drawing.Size(85, 18)
+$lblAlt.Text = "Altura:"
+$lblAlt.Location = New-Object System.Drawing.Point(12, 104)
+$lblAlt.Size = New-Object System.Drawing.Size(48, 18)
 $grp.Controls.Add($lblAlt)
 
 $script:numAltura = New-Object System.Windows.Forms.NumericUpDown
 $script:numAltura.Minimum = 1
 $script:numAltura.Maximum = 2000
 $script:numAltura.Value = 45
-$script:numAltura.Location = New-Object System.Drawing.Point(100, 76)
-$script:numAltura.Size = New-Object System.Drawing.Size(70, 22)
+$script:numAltura.Location = New-Object System.Drawing.Point(60, 102)
+$script:numAltura.Size = New-Object System.Drawing.Size(58, 22)
 $grp.Controls.Add($script:numAltura)
 
 $lblMod = New-Object System.Windows.Forms.Label
-$lblMod.Text = "Modulo/Mag:"
-$lblMod.Location = New-Object System.Drawing.Point(190, 78)
-$lblMod.Size = New-Object System.Drawing.Size(85, 18)
+$lblMod.Text = "Modulo:"
+$lblMod.Location = New-Object System.Drawing.Point(128, 104)
+$lblMod.Size = New-Object System.Drawing.Size(56, 18)
 $grp.Controls.Add($lblMod)
 
 $script:numModulo = New-Object System.Windows.Forms.NumericUpDown
 $script:numModulo.Minimum = 1
 $script:numModulo.Maximum = 10
 $script:numModulo.Value = 2
-$script:numModulo.Location = New-Object System.Drawing.Point(278, 76)
-$script:numModulo.Size = New-Object System.Drawing.Size(55, 22)
+$script:numModulo.Location = New-Object System.Drawing.Point(186, 102)
+$script:numModulo.Size = New-Object System.Drawing.Size(48, 22)
 $grp.Controls.Add($script:numModulo)
+
+$lblAncho = New-Object System.Windows.Forms.Label
+$lblAncho.Text = "Ancho bloq:"
+$lblAncho.Location = New-Object System.Drawing.Point(244, 104)
+$lblAncho.Size = New-Object System.Drawing.Size(78, 18)
+$grp.Controls.Add($lblAncho)
+
+$script:numAncho = New-Object System.Windows.Forms.NumericUpDown
+$script:numAncho.Minimum = 50
+$script:numAncho.Maximum = 2000
+$script:numAncho.Value = 400
+$script:numAncho.Increment = 10
+$script:numAncho.Location = New-Object System.Drawing.Point(324, 102)
+$script:numAncho.Size = New-Object System.Drawing.Size(64, 22)
+$grp.Controls.Add($script:numAncho)
 
 $script:chkMostrar = New-Object System.Windows.Forms.CheckBox
 $script:chkMostrar.Text = "Mostrar texto (barras)"
 $script:chkMostrar.Checked = $true
-$script:chkMostrar.Location = New-Object System.Drawing.Point(350, 77)
-$script:chkMostrar.Size = New-Object System.Drawing.Size(150, 22)
+$script:chkMostrar.Location = New-Object System.Drawing.Point(12, 135)
+$script:chkMostrar.Size = New-Object System.Drawing.Size(165, 22)
 $grp.Controls.Add($script:chkMostrar)
 
 $btnAplicarEl = New-Object System.Windows.Forms.Button
 $btnAplicarEl.Text = "Aplicar cambios"
-$btnAplicarEl.Location = New-Object System.Drawing.Point(90, 110)
+$btnAplicarEl.Location = New-Object System.Drawing.Point(250, 131)
 $btnAplicarEl.Size = New-Object System.Drawing.Size(120, 28)
 $grp.Controls.Add($btnAplicarEl)
 
 $script:lblPos = New-Object System.Windows.Forms.Label
 $script:lblPos.Text = "X: -  Y: - dots"
-$script:lblPos.Location = New-Object System.Drawing.Point(230, 116)
-$script:lblPos.Size = New-Object System.Drawing.Size(160, 18)
+$script:lblPos.Location = New-Object System.Drawing.Point(378, 137)
+$script:lblPos.Size = New-Object System.Drawing.Size(120, 18)
 $grp.Controls.Add($script:lblPos)
 
 $btnGenerar = New-Object System.Windows.Forms.Button
@@ -758,6 +835,7 @@ $cboPreset.Add_SelectedIndexChanged({
 })
 
 $btnAddTexto.Add_Click({ New-Elemento "Texto" })
+$btnAddParrafo.Add_Click({ New-Elemento "Parrafo" })
 $btnAddBarcode.Add_Click({ New-Elemento "Barcode" })
 $btnAddQR.Add_Click({ New-Elemento "QR" })
 $btnAddEmoji.Add_Click({
@@ -790,11 +868,43 @@ $btnAplicarEl.Add_Click({
     $el.Text     = $script:txtContenido.Text
     $el.Height   = [int]$script:numAltura.Value
     $el.Module   = [int]$script:numModulo.Value
+    $el.BlockW   = [int]$script:numAncho.Value
     $el.ShowText = $script:chkMostrar.Checked
     Refresh-Control $el
 })
 
 $script:panelCanvas.Add_MouseDown({ Select-Elemento $null })
+
+$btnLimpiar.Add_Click({
+    if ($script:elementos.Count -eq 0) { return }
+    $resp = [System.Windows.Forms.MessageBox]::Show("Borrar TODOS los elementos de la etiqueta?", "Limpiar todo",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+    if ($resp -eq [System.Windows.Forms.DialogResult]::Yes) {
+        foreach ($el in @($script:elementos)) { $script:panelCanvas.Controls.Remove($el.Ctrl) }
+        $script:elementos.Clear()
+        $script:selected = $null
+        Select-Elemento $null
+    }
+})
+
+$script:chkGrid.Add_CheckedChanged({
+    $script:snap = $script:chkGrid.Checked
+    $script:panelCanvas.Invalidate()
+})
+
+$script:panelCanvas.Add_Paint({
+    param($s, $e)
+    if ($script:snap) {
+        $step = $script:gridDots * $script:scale
+        if ($step -lt 4) { $step = 4 }
+        $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::FromArgb(225, 225, 225))
+        $gx = 0.0
+        while ($gx -lt $s.Width)  { $e.Graphics.DrawLine($pen, [int]$gx, 0, [int]$gx, $s.Height); $gx += $step }
+        $gy = 0.0
+        while ($gy -lt $s.Height) { $e.Graphics.DrawLine($pen, 0, [int]$gy, $s.Width, [int]$gy); $gy += $step }
+        $pen.Dispose()
+    }
+})
 
 $btnGenerar.Add_Click({
     $script:txtZpl.Text = Generar-ZPL
