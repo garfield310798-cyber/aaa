@@ -349,6 +349,67 @@ function New-Elemento($tipo) {
 }
 
 # ============================================================
+#  SELECTOR VISUAL DE EMOJIS (tipo teclado de celular)
+# ============================================================
+function Show-EmojiPicker {
+    $pick = New-Object System.Windows.Forms.Form
+    $pick.Text = "Emojis - toca uno"
+    $pick.ClientSize = New-Object System.Drawing.Size(360, 430)
+    $pick.StartPosition = "CenterParent"
+    $pick.FormBorderStyle = "FixedDialog"
+    $pick.MaximizeBox = $false
+    $pick.MinimizeBox = $false
+
+    $flow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $flow.Dock = "Fill"
+    $flow.AutoScroll = $true
+    $flow.WrapContents = $true
+    $flow.Padding = New-Object System.Windows.Forms.Padding(4)
+    $pick.Controls.Add($flow)
+
+    $script:emojiPick = $null
+
+    $cats = @(
+        @{ N = "Caras"; C = @(0x1F600,0x1F603,0x1F604,0x1F601,0x1F606,0x1F605,0x1F923,0x1F602,0x1F642,0x1F609,0x1F60A,0x1F60D,0x1F618,0x1F60E,0x1F914,0x1F610,0x1F62E,0x1F62D,0x1F621,0x1F631,0x1F973,0x1F60B,0x1F644,0x1F634,0x1F920,0x1F62C,0x1F971,0x1F913) },
+        @{ N = "Manos"; C = @(0x1F44D,0x1F44E,0x1F44C,0x1F44F,0x1F64C,0x1F64F,0x1F4AA,0x270B,0x1F44B,0x270C,0x1F91D,0x261D,0x1F446,0x1F447,0x1F448,0x1F449,0x1F44A,0x1F918) },
+        @{ N = "Corazones / estrellas"; C = @(0x2764,0x1F9E1,0x1F49B,0x1F49A,0x1F499,0x1F49C,0x1F5A4,0x1F494,0x2B50,0x1F31F,0x2728,0x1F525,0x1F4A5,0x1F4AF,0x1F389,0x1F388) },
+        @{ N = "Marcas / avisos"; C = @(0x2705,0x274C,0x2714,0x2716,0x2757,0x2753,0x26A0,0x1F6AB,0x1F4CC,0x1F4CD,0x1F511,0x1F512,0x1F513,0x1F50D,0x1F4A1,0x2699) },
+        @{ N = "Flechas"; C = @(0x2B06,0x2B07,0x2B05,0x27A1,0x2197,0x2198,0x2199,0x2196,0x21A9,0x21AA,0x1F501,0x1F504) },
+        @{ N = "Envio / objetos"; C = @(0x1F4E6,0x1F69A,0x2708,0x1F6D2,0x1F4B0,0x1F4B5,0x1F3F7,0x1F4CB,0x1F4C5,0x1F4C8,0x1F381,0x1F4F1,0x1F4BB,0x1F527,0x1F528,0x1F4E7) }
+    )
+
+    $clickHandler = {
+        param($s, $e)
+        $script:emojiPick = $s.Tag
+        $s.FindForm().Close()
+    }
+
+    foreach ($cat in $cats) {
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $cat.N
+        $lbl.AutoSize = $false
+        $lbl.Size = New-Object System.Drawing.Size(340, 20)
+        $lbl.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+        $lbl.Margin = New-Object System.Windows.Forms.Padding(2, 8, 2, 2)
+        $flow.Controls.Add($lbl)
+        $flow.SetFlowBreak($lbl, $true)
+        foreach ($cp in $cat.C) {
+            $em = [char]::ConvertFromUtf32($cp)
+            $b = New-Object System.Windows.Forms.Button
+            $b.Text = $em
+            $b.Font = New-Object System.Drawing.Font("Segoe UI Emoji", 14)
+            $b.Size = New-Object System.Drawing.Size(42, 42)
+            $b.Margin = New-Object System.Windows.Forms.Padding(2)
+            $b.Tag = $em
+            $b.Add_Click($clickHandler)
+            $flow.Controls.Add($b)
+        }
+    }
+    [void]$pick.ShowDialog()
+    return $script:emojiPick
+}
+
+# ============================================================
 #  GENERAR ZPL
 # ============================================================
 function Generar-ZPL {
@@ -698,7 +759,19 @@ $cboPreset.Add_SelectedIndexChanged({
 $btnAddTexto.Add_Click({ New-Elemento "Texto" })
 $btnAddBarcode.Add_Click({ New-Elemento "Barcode" })
 $btnAddQR.Add_Click({ New-Elemento "QR" })
-$btnAddEmoji.Add_Click({ New-Elemento "Emoji" })
+$btnAddEmoji.Add_Click({
+    $em = Show-EmojiPicker
+    if ($em -ne $null) {
+        if ($script:selected -ne $null -and $script:selected.Type -eq "Emoji") {
+            $script:selected.Text = $em
+        } else {
+            New-Elemento "Emoji"
+            $script:selected.Text = $em
+        }
+        $script:txtContenido.Text = $em
+        Refresh-Control $script:selected
+    }
+})
 
 $btnEliminar.Add_Click({
     if ($script:selected -ne $null) {
