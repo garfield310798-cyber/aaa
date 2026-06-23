@@ -1,0 +1,632 @@
+# ============================================================
+# DISENADOR DE ETIQUETAS ZPL  (Texto + Codigo de barras + QR)
+# Arrastra los elementos en el lienzo, genera el ZPL y enviala
+# por FTP o RAW 9100.  PowerShell 5.1 / Windows 11 - sin instalar nada.
+# ============================================================
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$Enc = [System.Text.Encoding]::GetEncoding(28591)   # Latin1: preserva bytes del ZPL
+
+# ------------------------------------------------------------
+#  ESTADO COMPARTIDO
+# ------------------------------------------------------------
+$script:elementos = New-Object System.Collections.ArrayList
+$script:selected  = $null
+$script:scale     = 1.0
+$script:labelW    = 609      # ancho de la etiqueta en dots (203dpi: 3" = 609)
+$script:labelH    = 406      # alto  de la etiqueta en dots (203dpi: 2" = 406)
+$script:dragging  = $false
+$script:dragOffX  = 0
+$script:dragOffY  = 0
+
+# ============================================================
+#  FUNCIONES DE ENVIO (FTP / RAW)
+# ============================================================
+function Send-ZplFtp {
+    param([string]$ip, [int]$port, [string]$zpl, [bool]$passive)
+    $uri = "ftp://${ip}:${port}/etiqueta.txt"
+    $req = [System.Net.FtpWebRequest]::Create($uri)
+    $req.Method      = [System.Net.WebRequestMethods+Ftp]::UploadFile
+    $req.Credentials = New-Object System.Net.NetworkCredential("anonymous", "")
+    $req.UseBinary   = $true
+    $req.UsePassive  = $passive
+    $req.KeepAlive   = $false
+    $req.Timeout     = 10000
+    $bytes = $Enc.GetBytes($zpl)
+    $req.ContentLength = $bytes.Length
+    $st = $req.GetRequestStream()
+    $st.Write($bytes, 0, $bytes.Length)
+    $st.Close()
+    $resp = [System.Net.FtpWebResponse]$req.GetResponse()
+    $estado = $resp.StatusDescription
+    $resp.Close()
+    return $estado.Trim()
+}
+
+function Send-ZplRaw {
+    param([string]$ip, [int]$port, [string]$zpl)
+    $client = New-Object System.Net.Sockets.TcpClient
+    $client.Connect($ip, $port)
+    $ns = $client.GetStream()
+    $bytes = $Enc.GetBytes($zpl)
+    $ns.Write($bytes, 0, $bytes.Length)
+    $ns.Flush()
+    $ns.Close()
+    $client.Close()
+    return "Enviado por RAW $port"
+}
+
+# ============================================================
+#  PINTADO DE PREVISUALIZACION (barras / QR aproximados)
+# ============================================================
+$BarcodePaint = {
+    param($s, $e)
+    $g = $e.Graphics
+    $g.Clear([System.Drawing.Color]::White)
+    $el = $s.Tag
+    $data = "$($el.Text)"
+    $h = $s.Height - 14
+    if ($h -lt 6) { $h = 6 }
+    $x = 2
+    for ($i = 0; $i -lt $data.Length -and $x -lt ($s.Width - 3); $i++) {
+        $code = [int][char]$data[$i]
+        $bw = ($code % 3) + 1
+        $g.FillRectangle([System.Drawing.Brushes]::Black, $x, 2, $bw, $h)
+        $x += $bw + (($code % 2) + 1)
+    }
+    if ($el.ShowText) {
+        $f = New-Object System.Drawing.Font("Consolas", 7)
+        $g.DrawString($data, $f, [System.Drawing.Brushes]::Black, 2, ($s.Height - 12))
+        $f.Dispose()
+    }
+}
+
+$QrPaint = {
+    param($s, $e)
+    $g = $e.Graphics
+    $g.Clear([System.Drawing.Color]::White)
+    $el = $s.Tag
+    $data = "$($el.Text)"
+    $n = 9
+    $cell = [int]($s.Width / $n)
+    if ($cell -lt 3) { $cell = 3 }
+    for ($r = 0; $r -lt $n; $r++) {
+        for ($c = 0; $c -lt $n; $c++) {
+            $ch = 1
+            if ($data.Length -gt 0) { $ch = [int][char]$data[(($r * $n) + $c) % $data.Length] }
+            if ((($ch + $r + $c) % 2) -eq 0) {
+                $g.FillRectangle([System.Drawing.Brushes]::Black, ($c * $cell), ($r * $cell), $cell, $cell)
+            }
+        }
+    }
+    # Marcas de esquina (look de QR)
+    $g.DrawRectangle([System.Drawing.Pens]::Black, 0, 0, ($cell * 3), ($cell * 3))
+    $g.DrawRectangle([System.Drawing.Pens]::Black, ($s.Width - ($cell * 3) - 1), 0, ($cell * 3), ($cell * 3))
+    $g.DrawRectangle([System.Drawing.Pens]::Black, 0, ($s.Height - ($cell * 3) - 1), ($cell * 3), ($cell * 3))
+}
+
+# ============================================================
+#  ARRASTRE DE ELEMENTOS
+# ============================================================
+$OnMouseDown = {
+    param($s, $e)
+    $script:dragging = $true
+    $script:dragOffX = $e.X
+    $script:dragOffY = $e.Y
+    Select-Elemento $s.Tag
+}
+$OnMouseMove = {
+    param($s, $e)
+    if ($script:dragging) {
+        $nl = $s.Left + $e.X - $script:dragOffX
+        $nt = $s.Top  + $e.Y - $script:dragOffY
+        if ($nl -lt 0) { $nl = 0 }
+        if ($nt -lt 0) { $nt = 0 }
+        if ($nl -gt ($script:panelCanvas.Width  - $s.Width))  { $nl = $script:panelCanvas.Width  - $s.Width }
+        if ($nt -gt ($script:panelCanvas.Height - $s.Height)) { $nt = $script:panelCanvas.Height - $s.Height }
+        $s.Left = $nl
+        $s.Top  = $nt
+        $el = $s.Tag
+        $el.X = [int]($nl / $script:scale)
+        $el.Y = [int]($nt / $script:scale)
+        $script:lblPos.Text = "X: $($el.X)  Y: $($el.Y) dots"
+    }
+}
+$OnMouseUp = {
+    param($s, $e)
+    $script:dragging = $false
+}
+
+# ============================================================
+#  HELPERS DE LIENZO / ELEMENTOS
+# ============================================================
+function Recalcular-Scale {
+    $maxW = 360.0
+    $maxH = 280.0
+    $sx = $maxW / $script:labelW
+    $sy = $maxH / $script:labelH
+    $script:scale = [Math]::Min($sx, $sy)
+    $script:panelCanvas.Width  = [int]($script:labelW * $script:scale)
+    $script:panelCanvas.Height = [int]($script:labelH * $script:scale)
+}
+
+function Refresh-Control($el) {
+    $c = $el.Ctrl
+    if ($el.Type -eq "Texto") {
+        $pt = [Math]::Round($el.Height * $script:scale * 0.75)
+        if ($pt -lt 6) { $pt = 6 }
+        $c.Font = New-Object System.Drawing.Font("Arial", $pt, [System.Drawing.FontStyle]::Bold)
+        $c.Text = $el.Text
+    }
+    elseif ($el.Type -eq "Barcode") {
+        $w = $el.Text.Length * 9
+        if ($w -lt 60) { $w = 60 }
+        $c.Width  = $w
+        $c.Height = [int]($el.Height * $script:scale) + 14
+        $c.Invalidate()
+    }
+    else {  # QR
+        $base = $el.Height
+        if ($base -le 0) { $base = 100 }
+        $side = [int]($base * $script:scale)
+        if ($side -lt 36) { $side = 36 }
+        $c.Width  = $side
+        $c.Height = $side
+        $c.Invalidate()
+    }
+    # reubicar segun coordenadas en dots
+    $c.Left = [int]($el.X * $script:scale)
+    $c.Top  = [int]($el.Y * $script:scale)
+}
+
+function Select-Elemento($el) {
+    $script:selected = $el
+    foreach ($x in $script:elementos) { $x.Ctrl.BorderStyle = 'None' }
+    if ($el -ne $null) {
+        $el.Ctrl.BorderStyle = 'FixedSingle'
+        $script:txtContenido.Text   = $el.Text
+        $script:numAltura.Value     = [decimal]([Math]::Max(1, [Math]::Min(2000, $el.Height)))
+        $script:numModulo.Value     = [decimal]([Math]::Max(1, [Math]::Min(10,   $el.Module)))
+        $script:chkMostrar.Checked  = [bool]$el.ShowText
+        $script:lblTipoSel.Text     = "Seleccionado: $($el.Type)"
+        $script:chkMostrar.Enabled  = ($el.Type -eq "Barcode")
+        $script:numModulo.Enabled   = ($el.Type -ne "Texto")
+    }
+    else {
+        $script:lblTipoSel.Text = "Seleccionado: (ninguno)"
+    }
+}
+
+function New-Elemento($tipo) {
+    $el = @{ Type = $tipo; X = 20; Y = 20; Text = ""; Height = 30; Module = 2; ShowText = $true; Ctrl = $null }
+    switch ($tipo) {
+        "Texto"   { $el.Text = "Texto";              $el.Height = 30 }
+        "Barcode" { $el.Text = "123456789";          $el.Height = 80; $el.Module = 2 }
+        "QR"      { $el.Text = "https://ejemplo.com"; $el.Height = 120; $el.Module = 5 }
+    }
+    if ($tipo -eq "Texto") {
+        $c = New-Object System.Windows.Forms.Label
+        $c.AutoSize  = $true
+        $c.BackColor = [System.Drawing.Color]::White
+    }
+    else {
+        $c = New-Object System.Windows.Forms.Panel
+        $c.BackColor = [System.Drawing.Color]::White
+        if ($tipo -eq "Barcode") { $c.Add_Paint($BarcodePaint) } else { $c.Add_Paint($QrPaint) }
+    }
+    $c.Tag = $el
+    $el.Ctrl = $c
+    $c.Add_MouseDown($OnMouseDown)
+    $c.Add_MouseMove($OnMouseMove)
+    $c.Add_MouseUp($OnMouseUp)
+    $script:panelCanvas.Controls.Add($c)
+    [void]$script:elementos.Add($el)
+    Refresh-Control $el
+    Select-Elemento $el
+}
+
+# ============================================================
+#  GENERAR ZPL DESDE EL DISENO
+# ============================================================
+function Generar-ZPL {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine("^XA")
+    [void]$sb.AppendLine("^CI28")                       # UTF-8 (acentos)
+    [void]$sb.AppendLine("^PW$([int]$script:labelW)")   # ancho de impresion
+    [void]$sb.AppendLine("^LL$([int]$script:labelH)")   # largo de etiqueta
+    foreach ($el in $script:elementos) {
+        $x = [int]$el.X
+        $y = [int]$el.Y
+        if ($el.Type -eq "Texto") {
+            $h = [int]$el.Height
+            $w = [int]($h * 0.6)
+            [void]$sb.AppendLine("^FO$x,$y^A0N,$h,$w^FD$($el.Text)^FS")
+        }
+        elseif ($el.Type -eq "Barcode") {
+            $h = [int]$el.Height
+            $by = [int]$el.Module
+            $line = 'N'
+            if ($el.ShowText) { $line = 'Y' }
+            [void]$sb.AppendLine("^FO$x,$y^BY$by^BCN,$h,$line,N,N^FD$($el.Text)^FS")
+        }
+        else {  # QR
+            $mag = [int]$el.Module
+            [void]$sb.AppendLine("^FO$x,$y^BQN,2,$mag^FDQA,$($el.Text)^FS")
+        }
+    }
+    [void]$sb.AppendLine("^XZ")
+    return $sb.ToString()
+}
+
+# ============================================================
+#  FORMULARIO PRINCIPAL
+# ============================================================
+$form = New-Object System.Windows.Forms.Form
+$form.Text          = "Disenador de etiquetas ZPL"
+$form.ClientSize    = New-Object System.Drawing.Size(530, 600)
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox   = $false
+$form.StartPosition = "CenterScreen"
+$form.Font          = New-Object System.Drawing.Font("Segoe UI", 9)
+
+$tabs = New-Object System.Windows.Forms.TabControl
+$tabs.Dock = "Fill"
+$form.Controls.Add($tabs)
+
+$tabDiseno = New-Object System.Windows.Forms.TabPage
+$tabDiseno.Text = "Disenar"
+$tabs.TabPages.Add($tabDiseno)
+
+$tabEnviar = New-Object System.Windows.Forms.TabPage
+$tabEnviar.Text = "Enviar"
+$tabs.TabPages.Add($tabEnviar)
+
+# ------------------------------------------------------------
+#  PESTANA: DISENAR
+# ------------------------------------------------------------
+# Tamano de etiqueta
+$lblW = New-Object System.Windows.Forms.Label
+$lblW.Text = "Ancho (dots):"
+$lblW.Location = New-Object System.Drawing.Point(10, 12)
+$lblW.Size = New-Object System.Drawing.Size(80, 18)
+$tabDiseno.Controls.Add($lblW)
+
+$txtW = New-Object System.Windows.Forms.TextBox
+$txtW.Text = "$script:labelW"
+$txtW.Location = New-Object System.Drawing.Point(92, 9)
+$txtW.Size = New-Object System.Drawing.Size(55, 22)
+$tabDiseno.Controls.Add($txtW)
+
+$lblH = New-Object System.Windows.Forms.Label
+$lblH.Text = "Alto (dots):"
+$lblH.Location = New-Object System.Drawing.Point(158, 12)
+$lblH.Size = New-Object System.Drawing.Size(70, 18)
+$tabDiseno.Controls.Add($lblH)
+
+$txtH = New-Object System.Windows.Forms.TextBox
+$txtH.Text = "$script:labelH"
+$txtH.Location = New-Object System.Drawing.Point(228, 9)
+$txtH.Size = New-Object System.Drawing.Size(55, 22)
+$tabDiseno.Controls.Add($txtH)
+
+$btnTam = New-Object System.Windows.Forms.Button
+$btnTam.Text = "Aplicar tamano"
+$btnTam.Location = New-Object System.Drawing.Point(290, 8)
+$btnTam.Size = New-Object System.Drawing.Size(100, 25)
+$tabDiseno.Controls.Add($btnTam)
+
+# Lienzo
+$script:panelCanvas = New-Object System.Windows.Forms.Panel
+$script:panelCanvas.Location = New-Object System.Drawing.Point(10, 42)
+$script:panelCanvas.BackColor = [System.Drawing.Color]::White
+$script:panelCanvas.BorderStyle = "FixedSingle"
+$tabDiseno.Controls.Add($script:panelCanvas)
+
+# Columna derecha: herramientas
+$colX = 400
+
+$btnAddTexto = New-Object System.Windows.Forms.Button
+$btnAddTexto.Text = "+ Texto"
+$btnAddTexto.Location = New-Object System.Drawing.Point($colX, 42)
+$btnAddTexto.Size = New-Object System.Drawing.Size(115, 28)
+$tabDiseno.Controls.Add($btnAddTexto)
+
+$btnAddBarcode = New-Object System.Windows.Forms.Button
+$btnAddBarcode.Text = "+ Codigo barras"
+$btnAddBarcode.Location = New-Object System.Drawing.Point($colX, 74)
+$btnAddBarcode.Size = New-Object System.Drawing.Size(115, 28)
+$tabDiseno.Controls.Add($btnAddBarcode)
+
+$btnAddQR = New-Object System.Windows.Forms.Button
+$btnAddQR.Text = "+ QR"
+$btnAddQR.Location = New-Object System.Drawing.Point($colX, 106)
+$btnAddQR.Size = New-Object System.Drawing.Size(115, 28)
+$tabDiseno.Controls.Add($btnAddQR)
+
+$btnEliminar = New-Object System.Windows.Forms.Button
+$btnEliminar.Text = "Eliminar"
+$btnEliminar.Location = New-Object System.Drawing.Point($colX, 138)
+$btnEliminar.Size = New-Object System.Drawing.Size(115, 28)
+$tabDiseno.Controls.Add($btnEliminar)
+
+# Grupo de propiedades
+$grp = New-Object System.Windows.Forms.GroupBox
+$grp.Text = "Propiedades"
+$grp.Location = New-Object System.Drawing.Point(10, 332)
+$grp.Size = New-Object System.Drawing.Size(505, 168)
+$tabDiseno.Controls.Add($grp)
+
+$script:lblTipoSel = New-Object System.Windows.Forms.Label
+$script:lblTipoSel.Text = "Seleccionado: (ninguno)"
+$script:lblTipoSel.Location = New-Object System.Drawing.Point(12, 22)
+$script:lblTipoSel.Size = New-Object System.Drawing.Size(300, 18)
+$grp.Controls.Add($script:lblTipoSel)
+
+$lblCont = New-Object System.Windows.Forms.Label
+$lblCont.Text = "Contenido:"
+$lblCont.Location = New-Object System.Drawing.Point(12, 50)
+$lblCont.Size = New-Object System.Drawing.Size(75, 18)
+$grp.Controls.Add($lblCont)
+
+$script:txtContenido = New-Object System.Windows.Forms.TextBox
+$script:txtContenido.Location = New-Object System.Drawing.Point(90, 47)
+$script:txtContenido.Size = New-Object System.Drawing.Size(400, 22)
+$grp.Controls.Add($script:txtContenido)
+
+$lblAlt = New-Object System.Windows.Forms.Label
+$lblAlt.Text = "Altura (dots):"
+$lblAlt.Location = New-Object System.Drawing.Point(12, 82)
+$lblAlt.Size = New-Object System.Drawing.Size(85, 18)
+$grp.Controls.Add($lblAlt)
+
+$script:numAltura = New-Object System.Windows.Forms.NumericUpDown
+$script:numAltura.Minimum = 1
+$script:numAltura.Maximum = 2000
+$script:numAltura.Value = 30
+$script:numAltura.Location = New-Object System.Drawing.Point(100, 80)
+$script:numAltura.Size = New-Object System.Drawing.Size(70, 22)
+$grp.Controls.Add($script:numAltura)
+
+$lblMod = New-Object System.Windows.Forms.Label
+$lblMod.Text = "Modulo/Mag:"
+$lblMod.Location = New-Object System.Drawing.Point(190, 82)
+$lblMod.Size = New-Object System.Drawing.Size(85, 18)
+$grp.Controls.Add($lblMod)
+
+$script:numModulo = New-Object System.Windows.Forms.NumericUpDown
+$script:numModulo.Minimum = 1
+$script:numModulo.Maximum = 10
+$script:numModulo.Value = 2
+$script:numModulo.Location = New-Object System.Drawing.Point(278, 80)
+$script:numModulo.Size = New-Object System.Drawing.Size(55, 22)
+$grp.Controls.Add($script:numModulo)
+
+$script:chkMostrar = New-Object System.Windows.Forms.CheckBox
+$script:chkMostrar.Text = "Mostrar texto (barras)"
+$script:chkMostrar.Checked = $true
+$script:chkMostrar.Location = New-Object System.Drawing.Point(350, 81)
+$script:chkMostrar.Size = New-Object System.Drawing.Size(150, 22)
+$grp.Controls.Add($script:chkMostrar)
+
+$btnAplicarEl = New-Object System.Windows.Forms.Button
+$btnAplicarEl.Text = "Aplicar cambios"
+$btnAplicarEl.Location = New-Object System.Drawing.Point(90, 115)
+$btnAplicarEl.Size = New-Object System.Drawing.Size(120, 28)
+$grp.Controls.Add($btnAplicarEl)
+
+$script:lblPos = New-Object System.Windows.Forms.Label
+$script:lblPos.Text = "X: -  Y: - dots"
+$script:lblPos.Location = New-Object System.Drawing.Point(230, 121)
+$script:lblPos.Size = New-Object System.Drawing.Size(160, 18)
+$grp.Controls.Add($script:lblPos)
+
+# Generar ZPL
+$btnGenerar = New-Object System.Windows.Forms.Button
+$btnGenerar.Text = "Generar ZPL  ->  Enviar"
+$btnGenerar.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnGenerar.Location = New-Object System.Drawing.Point(10, 510)
+$btnGenerar.Size = New-Object System.Drawing.Size(505, 34)
+$tabDiseno.Controls.Add($btnGenerar)
+
+# ------------------------------------------------------------
+#  PESTANA: ENVIAR
+# ------------------------------------------------------------
+$lblIp = New-Object System.Windows.Forms.Label
+$lblIp.Text = "IP de la impresora:"
+$lblIp.Location = New-Object System.Drawing.Point(10, 12)
+$lblIp.Size = New-Object System.Drawing.Size(150, 18)
+$tabEnviar.Controls.Add($lblIp)
+
+$txtIp = New-Object System.Windows.Forms.TextBox
+$txtIp.Location = New-Object System.Drawing.Point(10, 32)
+$txtIp.Size = New-Object System.Drawing.Size(200, 22)
+$tabEnviar.Controls.Add($txtIp)
+
+$lblMetodo = New-Object System.Windows.Forms.Label
+$lblMetodo.Text = "Metodo:"
+$lblMetodo.Location = New-Object System.Drawing.Point(230, 12)
+$lblMetodo.Size = New-Object System.Drawing.Size(120, 18)
+$tabEnviar.Controls.Add($lblMetodo)
+
+$cboMetodo = New-Object System.Windows.Forms.ComboBox
+$cboMetodo.DropDownStyle = "DropDownList"
+$cboMetodo.Items.AddRange(@("FTP (21)", "RAW (9100)"))
+$cboMetodo.SelectedIndex = 0
+$cboMetodo.Location = New-Object System.Drawing.Point(230, 32)
+$cboMetodo.Size = New-Object System.Drawing.Size(130, 22)
+$tabEnviar.Controls.Add($cboMetodo)
+
+$lblPuerto = New-Object System.Windows.Forms.Label
+$lblPuerto.Text = "Puerto:"
+$lblPuerto.Location = New-Object System.Drawing.Point(10, 62)
+$lblPuerto.Size = New-Object System.Drawing.Size(80, 18)
+$tabEnviar.Controls.Add($lblPuerto)
+
+$txtPuerto = New-Object System.Windows.Forms.TextBox
+$txtPuerto.Text = "21"
+$txtPuerto.Location = New-Object System.Drawing.Point(10, 82)
+$txtPuerto.Size = New-Object System.Drawing.Size(80, 22)
+$tabEnviar.Controls.Add($txtPuerto)
+
+$chkPasivo = New-Object System.Windows.Forms.CheckBox
+$chkPasivo.Text = "Modo pasivo (FTP)"
+$chkPasivo.Checked = $true
+$chkPasivo.Location = New-Object System.Drawing.Point(110, 82)
+$chkPasivo.Size = New-Object System.Drawing.Size(230, 22)
+$tabEnviar.Controls.Add($chkPasivo)
+
+$cboMetodo.Add_SelectedIndexChanged({
+    if ($cboMetodo.SelectedItem -eq "RAW (9100)") {
+        $txtPuerto.Text = "9100"
+        $chkPasivo.Enabled = $false
+    } else {
+        $txtPuerto.Text = "21"
+        $chkPasivo.Enabled = $true
+    }
+})
+
+$lblZpl = New-Object System.Windows.Forms.Label
+$lblZpl.Text = "Codigo ZPL (editable):"
+$lblZpl.Location = New-Object System.Drawing.Point(10, 114)
+$lblZpl.Size = New-Object System.Drawing.Size(200, 18)
+$tabEnviar.Controls.Add($lblZpl)
+
+$script:txtZpl = New-Object System.Windows.Forms.TextBox
+$script:txtZpl.Multiline = $true
+$script:txtZpl.ScrollBars = "Vertical"
+$script:txtZpl.WordWrap = $false
+$script:txtZpl.Font = New-Object System.Drawing.Font("Consolas", 9)
+$script:txtZpl.Location = New-Object System.Drawing.Point(10, 134)
+$script:txtZpl.Size = New-Object System.Drawing.Size(505, 230)
+$tabEnviar.Controls.Add($script:txtZpl)
+
+$btnCargar = New-Object System.Windows.Forms.Button
+$btnCargar.Text = "Cargar .txt..."
+$btnCargar.Location = New-Object System.Drawing.Point(10, 372)
+$btnCargar.Size = New-Object System.Drawing.Size(115, 28)
+$tabEnviar.Controls.Add($btnCargar)
+
+$btnEnviar = New-Object System.Windows.Forms.Button
+$btnEnviar.Text = "Enviar a impresora"
+$btnEnviar.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$btnEnviar.Location = New-Object System.Drawing.Point(355, 372)
+$btnEnviar.Size = New-Object System.Drawing.Size(160, 28)
+$tabEnviar.Controls.Add($btnEnviar)
+
+$lblLog = New-Object System.Windows.Forms.Label
+$lblLog.Text = "Estado:"
+$lblLog.Location = New-Object System.Drawing.Point(10, 408)
+$lblLog.Size = New-Object System.Drawing.Size(150, 18)
+$tabEnviar.Controls.Add($lblLog)
+
+$script:txtLog = New-Object System.Windows.Forms.TextBox
+$script:txtLog.Multiline = $true
+$script:txtLog.ReadOnly = $true
+$script:txtLog.ScrollBars = "Vertical"
+$script:txtLog.Location = New-Object System.Drawing.Point(10, 428)
+$script:txtLog.Size = New-Object System.Drawing.Size(505, 120)
+$tabEnviar.Controls.Add($script:txtLog)
+
+function Escribir-Log([string]$msg) {
+    $script:txtLog.AppendText((Get-Date -Format "HH:mm:ss") + "  " + $msg + "`r`n")
+}
+
+# ============================================================
+#  EVENTOS
+# ============================================================
+$btnTam.Add_Click({
+    $w = 0; $h = 0
+    if (-not [int]::TryParse($txtW.Text.Trim(), [ref]$w) -or $w -lt 50) { $w = 609 }
+    if (-not [int]::TryParse($txtH.Text.Trim(), [ref]$h) -or $h -lt 50) { $h = 406 }
+    $script:labelW = $w
+    $script:labelH = $h
+    $txtW.Text = "$w"; $txtH.Text = "$h"
+    Recalcular-Scale
+    foreach ($el in $script:elementos) { Refresh-Control $el }
+})
+
+$btnAddTexto.Add_Click({ New-Elemento "Texto" })
+$btnAddBarcode.Add_Click({ New-Elemento "Barcode" })
+$btnAddQR.Add_Click({ New-Elemento "QR" })
+
+$btnEliminar.Add_Click({
+    if ($script:selected -ne $null) {
+        $el = $script:selected
+        $script:panelCanvas.Controls.Remove($el.Ctrl)
+        $script:elementos.Remove($el)
+        $script:selected = $null
+        Select-Elemento $null
+    }
+})
+
+$btnAplicarEl.Add_Click({
+    if ($script:selected -eq $null) { return }
+    $el = $script:selected
+    $el.Text     = $script:txtContenido.Text
+    $el.Height   = [int]$script:numAltura.Value
+    $el.Module   = [int]$script:numModulo.Value
+    $el.ShowText = $script:chkMostrar.Checked
+    Refresh-Control $el
+})
+
+$script:panelCanvas.Add_MouseDown({ Select-Elemento $null })
+
+$btnGenerar.Add_Click({
+    $script:txtZpl.Text = Generar-ZPL
+    $tabs.SelectedTab = $tabEnviar
+})
+
+$btnCargar.Add_Click({
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Filter = "Etiquetas (*.txt;*.zpl;*.prn)|*.txt;*.zpl;*.prn|Todos (*.*)|*.*"
+    if ($dlg.ShowDialog() -eq "OK") {
+        $script:txtZpl.Text = [System.IO.File]::ReadAllText($dlg.FileName, $Enc)
+    }
+})
+
+$btnEnviar.Add_Click({
+    $ip  = $txtIp.Text.Trim()
+    $zpl = $script:txtZpl.Text
+    if ([string]::IsNullOrWhiteSpace($ip)) {
+        [System.Windows.Forms.MessageBox]::Show("Escribe la IP de la impresora.", "Falta IP",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+    if ([string]::IsNullOrWhiteSpace($zpl)) {
+        [System.Windows.Forms.MessageBox]::Show("No hay ZPL. Genera el diseno o carga un .txt.", "Falta ZPL",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+    $puerto = 0
+    if (-not [int]::TryParse($txtPuerto.Text.Trim(), [ref]$puerto)) {
+        [System.Windows.Forms.MessageBox]::Show("Puerto invalido.", "Error",
+            [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+    $btnEnviar.Enabled = $false
+    try {
+        if ($cboMetodo.SelectedItem -eq "RAW (9100)") {
+            Escribir-Log "Enviando por RAW a ${ip}:${puerto} ..."
+            $r = Send-ZplRaw -ip $ip -port $puerto -zpl $zpl
+        } else {
+            Escribir-Log "Enviando por FTP a ${ip}:${puerto} ..."
+            $r = Send-ZplFtp -ip $ip -port $puerto -zpl $zpl -passive $chkPasivo.Checked
+        }
+        Escribir-Log "OK -> $r"
+    }
+    catch {
+        Escribir-Log "ERROR: $($_.Exception.Message)"
+    }
+    finally {
+        $btnEnviar.Enabled = $true
+    }
+})
+
+# ============================================================
+#  INICIO
+# ============================================================
+Recalcular-Scale
+[void]$form.ShowDialog()
