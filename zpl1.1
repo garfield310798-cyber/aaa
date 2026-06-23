@@ -27,6 +27,7 @@ $script:dragOffX  = 0
 $script:dragOffY  = 0
 $script:snap      = $false
 $script:gridDots  = 20
+$script:fontCal   = 0.75     # calibracion de la letra del preview vs impresion
 
 # ------------------------------------------------------------
 #  TABLA DE PATRONES CODE128 (valor 0..106 -> anchos de modulos)
@@ -279,13 +280,13 @@ function Recalcular-Scale {
 function Refresh-Control($el) {
     $c = $el.Ctrl
     if ($el.Type -eq "Texto") {
-        $pt = [Math]::Round($el.Height * $script:scale)
+        $pt = [Math]::Round($el.Height * $script:scale * $script:fontCal)
         if ($pt -lt 6) { $pt = 6 }
         $c.Font = New-Object System.Drawing.Font("Arial", $pt, [System.Drawing.FontStyle]::Bold)
         $c.Text = $el.Text
     }
     elseif ($el.Type -eq "Parrafo") {
-        $pt = [Math]::Round($el.Height * $script:scale)
+        $pt = [Math]::Round($el.Height * $script:scale * $script:fontCal)
         if ($pt -lt 6) { $pt = 6 }
         $bw = [int]($el.BlockW * $script:scale)
         if ($bw -lt 30) { $bw = 30 }
@@ -617,6 +618,21 @@ $script:chkGrid.Location = New-Object System.Drawing.Point($colX, 268)
 $script:chkGrid.Size = New-Object System.Drawing.Size(135, 22)
 $tabDiseno.Controls.Add($script:chkGrid)
 
+$lblCal = New-Object System.Windows.Forms.Label
+$lblCal.Text = "Letra %:"
+$lblCal.Location = New-Object System.Drawing.Point($colX, 300)
+$lblCal.Size = New-Object System.Drawing.Size(52, 18)
+$tabDiseno.Controls.Add($lblCal)
+
+$script:numCal = New-Object System.Windows.Forms.NumericUpDown
+$script:numCal.Minimum = 30
+$script:numCal.Maximum = 200
+$script:numCal.Value = 75
+$script:numCal.Increment = 5
+$script:numCal.Location = New-Object System.Drawing.Point(($colX + 54), 297)
+$script:numCal.Size = New-Object System.Drawing.Size(56, 22)
+$tabDiseno.Controls.Add($script:numCal)
+
 $grp = New-Object System.Windows.Forms.GroupBox
 $grp.Text = "Propiedades"
 $grp.Location = New-Object System.Drawing.Point(10, 338)
@@ -897,6 +913,13 @@ $btnLimpiar.Add_Click({
 $script:chkGrid.Add_CheckedChanged({
     $script:snap = $script:chkGrid.Checked
     $script:panelCanvas.Invalidate()
+})
+
+$script:numCal.Add_ValueChanged({
+    $script:fontCal = [double]$script:numCal.Value / 100.0
+    foreach ($el in $script:elementos) {
+        if ($el.Type -eq "Texto" -or $el.Type -eq "Parrafo") { Refresh-Control $el }
+    }
 })
 
 $script:panelCanvas.Add_Paint({
