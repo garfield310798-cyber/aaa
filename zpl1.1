@@ -1,9 +1,7 @@
 # ============================================================
-#powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "%USERPROFILE%\Desktop\zpl.ps1"
-#
-# DISENADOR DE ETIQUETAS ZPL  (Texto + Codigo de barras + QR)
-# Arrastra los elementos en el lienzo, genera el ZPL y enviala
-# por FTP o RAW 9100.  PowerShell 5.1 / Windows 11 - sin instalar nada.
+# DISENADOR DE ETIQUETAS ZPL
+# Texto + Code128 REAL + QR + Emoji (bitmap ^GFA)
+# Hoja por defecto 4x6 pulgadas (203 dpi).  PowerShell 5.1, sin instalar nada.
 # ============================================================
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -18,14 +16,59 @@ $Enc = [System.Text.Encoding]::GetEncoding(28591)   # Latin1: preserva bytes del
 $script:elementos = New-Object System.Collections.ArrayList
 $script:selected  = $null
 $script:scale     = 1.0
-$script:labelW    = 812      # ancho de la etiqueta en dots (4" x 203dpi = 812)
-$script:labelH    = 1218     # alto  de la etiqueta en dots (6" x 203dpi = 1218)
+$script:labelW    = 812      # 4" x 203dpi
+$script:labelH    = 1218     # 6" x 203dpi
 $script:dragging  = $false
 $script:dragOffX  = 0
 $script:dragOffY  = 0
 
+# ------------------------------------------------------------
+#  TABLA DE PATRONES CODE128 (valor 0..106 -> anchos de modulos)
+# ------------------------------------------------------------
+$script:C128 = @(
+ "212222","222122","222221","121223","121322","131222","122213","122312","132212","221213",
+ "221312","231212","112232","122132","122231","113222","123122","123221","223211","221132",
+ "221231","213212","223112","312131","311222","321122","321221","312212","322112","322211",
+ "212123","212321","232121","111323","131123","131321","112313","132113","132311","211313",
+ "231113","231311","112133","112331","132131","113123","113321","133121","313121","211331",
+ "231131","213113","213311","213131","311123","311321","331121","312113","312311","332111",
+ "314111","221411","431111","111224","111422","121124","121421","141122","141221","112214",
+ "112412","122114","122411","142112","142211","241211","221114","413111","241112","134111",
+ "111242","121142","121241","114212","124112","124211","411212","421112","421211","212141",
+ "214121","412121","111143","111341","131141","114113","114311","411113","411311","113141",
+ "114131","311141","411131","211412","211214","211232","2331112"
+)
+
+# Devuelve lista de modulos @{w=ancho; bar=$true/$false} para Code128 subset B
+function Get-C128Modules($data) {
+    $mods = New-Object System.Collections.ArrayList
+    $values = New-Object System.Collections.ArrayList
+    [void]$values.Add(104)            # Start B
+    $weighted = 104
+    $pos = 1
+    foreach ($chr in ("$data").ToCharArray()) {
+        $v = [int][char]$chr - 32      # subset B: ASCII 32..126 -> 0..94
+        if ($v -lt 0 -or $v -gt 94) { $v = 0 }
+        [void]$values.Add($v)
+        $weighted += $v * $pos
+        $pos++
+    }
+    $check = $weighted % 103           # digito de control modulo 103
+    [void]$values.Add($check)
+    [void]$values.Add(106)             # Stop
+    $isBar = $true
+    foreach ($v in $values) {
+        $pat = $script:C128[$v]
+        foreach ($d in $pat.ToCharArray()) {
+            [void]$mods.Add(@{ w = [int]([string]$d); bar = $isBar })
+            $isBar = -not $isBar
+        }
+    }
+    return $mods
+}
+
 # ============================================================
-#  FUNCIONES DE ENVIO (FTP / RAW)
+#  ENVIO (FTP / RAW)
 # ============================================================
 function Send-ZplFtp {
     param([string]$ip, [int]$port, [string]$zpl, [bool]$passive)
@@ -62,26 +105,72 @@ function Send-ZplRaw {
 }
 
 # ============================================================
-#  PINTADO DE PREVISUALIZACION (barras / QR aproximados)
+#  EMOJI -> BITMAP MONOCROMO -> ^GFA
+# ============================================================
+function Emoji-ToZpl($texto, $sizeDots, $x, $y) {
+    $w = [int]$sizeDots
+    $h = [int]$sizeDots
+    if ($w -gt 480) { $w = 480; $h = 480 }
+    if ($w -lt 8)  { $w = 8;  $h = 8 }
+
+    $bmp = New-Object System.Drawing.Bitmap $w, $h
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::White)
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+    $font = New-Object System.Drawing.Font("Segoe UI Emoji", ($h * 0.8), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $rect = New-Object System.Drawing.RectangleF 0, 0, $w, $h
+    $g.DrawString("$texto", $font, [System.Drawing.Brushes]::Black, $rect, $sf)
+    $g.Dispose()
+    $font.Dispose()
+    $sf.Dispose()
+
+    $bytesPerRow = [int][Math]::Ceiling($w / 8.0)
+    $sb = New-Object System.Text.StringBuilder
+    for ($yy = 0; $yy -lt $h; $yy++) {
+        for ($bx = 0; $bx -lt $bytesPerRow; $bx++) {
+            $b = 0
+            for ($bit = 0; $bit -lt 8; $bit++) {
+                $px = ($bx * 8) + $bit
+                if ($px -lt $w) {
+                    $col = $bmp.GetPixel($px, $yy)
+                    $lum = ($col.R + $col.G + $col.B) / 3
+                    if ($lum -lt 128) { $b = $b -bor (1 -shl (7 - $bit)) }
+                }
+            }
+            [void]$sb.Append($b.ToString("X2"))
+        }
+    }
+    $bmp.Dispose()
+    $total = $bytesPerRow * $h
+    return "^FO$x,$y^GFA,$total,$total,$bytesPerRow,$($sb.ToString())^FS"
+}
+
+# ============================================================
+#  PINTADO DE PREVISUALIZACION
 # ============================================================
 $BarcodePaint = {
     param($s, $e)
     $g = $e.Graphics
     $g.Clear([System.Drawing.Color]::White)
     $el = $s.Tag
-    $data = "$($el.Text)"
-    $h = $s.Height - 14
-    if ($h -lt 6) { $h = 6 }
-    $x = 2
-    for ($i = 0; $i -lt $data.Length -and $x -lt ($s.Width - 3); $i++) {
-        $code = [int][char]$data[$i]
-        $bw = ($code % 3) + 1
-        $g.FillRectangle([System.Drawing.Brushes]::Black, $x, 2, $bw, $h)
-        $x += $bw + (($code % 2) + 1)
+    $mods = Get-C128Modules "$($el.Text)"
+    $modPx = [Math]::Max(1, [int][Math]::Round($el.Module * $script:scale))
+    $textArea = 2
+    if ($el.ShowText) { $textArea = 14 }
+    $barH = $s.Height - $textArea
+    if ($barH -lt 4) { $barH = 4 }
+    $x = 10 * $modPx
+    foreach ($m in $mods) {
+        $wpx = $m.w * $modPx
+        if ($m.bar) { $g.FillRectangle([System.Drawing.Brushes]::Black, $x, 0, $wpx, $barH) }
+        $x += $wpx
     }
     if ($el.ShowText) {
         $f = New-Object System.Drawing.Font("Consolas", 7)
-        $g.DrawString($data, $f, [System.Drawing.Brushes]::Black, 2, ($s.Height - 12))
+        $g.DrawString("$($el.Text)", $f, [System.Drawing.Brushes]::Black, (10 * $modPx), ($s.Height - 12))
         $f.Dispose()
     }
 }
@@ -104,14 +193,30 @@ $QrPaint = {
             }
         }
     }
-    # Marcas de esquina (look de QR)
     $g.DrawRectangle([System.Drawing.Pens]::Black, 0, 0, ($cell * 3), ($cell * 3))
     $g.DrawRectangle([System.Drawing.Pens]::Black, ($s.Width - ($cell * 3) - 1), 0, ($cell * 3), ($cell * 3))
     $g.DrawRectangle([System.Drawing.Pens]::Black, 0, ($s.Height - ($cell * 3) - 1), ($cell * 3), ($cell * 3))
 }
 
+$EmojiPaint = {
+    param($s, $e)
+    $g = $e.Graphics
+    $g.Clear([System.Drawing.Color]::White)
+    $el = $s.Tag
+    $sz = $s.Height
+    if ($sz -lt 8) { $sz = 8 }
+    $f = New-Object System.Drawing.Font("Segoe UI Emoji", ($sz * 0.8), [System.Drawing.FontStyle]::Regular, [System.Drawing.GraphicsUnit]::Pixel)
+    $sf = New-Object System.Drawing.StringFormat
+    $sf.Alignment = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $rect = New-Object System.Drawing.RectangleF 0, 0, $s.Width, $s.Height
+    $g.DrawString("$($el.Text)", $f, [System.Drawing.Brushes]::Black, $rect, $sf)
+    $f.Dispose()
+    $sf.Dispose()
+}
+
 # ============================================================
-#  ARRASTRE DE ELEMENTOS
+#  ARRASTRE
 # ============================================================
 $OnMouseDown = {
     param($s, $e)
@@ -147,7 +252,7 @@ $OnMouseUp = {
 # ============================================================
 function Recalcular-Scale {
     $maxW = 360.0
-    $maxH = 280.0
+    $maxH = 290.0
     $sx = $maxW / $script:labelW
     $sy = $maxH / $script:labelH
     $script:scale = [Math]::Min($sx, $sy)
@@ -164,10 +269,21 @@ function Refresh-Control($el) {
         $c.Text = $el.Text
     }
     elseif ($el.Type -eq "Barcode") {
-        $w = $el.Text.Length * 9
-        if ($w -lt 60) { $w = 60 }
-        $c.Width  = $w
-        $c.Height = [int]($el.Height * $script:scale) + 14
+        $mods = Get-C128Modules "$($el.Text)"
+        $units = 0
+        foreach ($m in $mods) { $units += $m.w }
+        $modPx = [Math]::Max(1, [int][Math]::Round($el.Module * $script:scale))
+        $c.Width  = ($units + 20) * $modPx
+        $extra = 4
+        if ($el.ShowText) { $extra = 16 }
+        $c.Height = [int]($el.Height * $script:scale) + $extra
+        $c.Invalidate()
+    }
+    elseif ($el.Type -eq "Emoji") {
+        $side = [int]($el.Height * $script:scale)
+        if ($side -lt 24) { $side = 24 }
+        $c.Width  = $side
+        $c.Height = $side
         $c.Invalidate()
     }
     else {  # QR
@@ -179,7 +295,6 @@ function Refresh-Control($el) {
         $c.Height = $side
         $c.Invalidate()
     }
-    # reubicar segun coordenadas en dots
     $c.Left = [int]($el.X * $script:scale)
     $c.Top  = [int]($el.Y * $script:scale)
 }
@@ -189,13 +304,13 @@ function Select-Elemento($el) {
     foreach ($x in $script:elementos) { $x.Ctrl.BorderStyle = 'None' }
     if ($el -ne $null) {
         $el.Ctrl.BorderStyle = 'FixedSingle'
-        $script:txtContenido.Text   = $el.Text
-        $script:numAltura.Value     = [decimal]([Math]::Max(1, [Math]::Min(2000, $el.Height)))
-        $script:numModulo.Value     = [decimal]([Math]::Max(1, [Math]::Min(10,   $el.Module)))
-        $script:chkMostrar.Checked  = [bool]$el.ShowText
-        $script:lblTipoSel.Text     = "Seleccionado: $($el.Type)"
-        $script:chkMostrar.Enabled  = ($el.Type -eq "Barcode")
-        $script:numModulo.Enabled   = ($el.Type -ne "Texto")
+        $script:txtContenido.Text  = $el.Text
+        $script:numAltura.Value    = [decimal]([Math]::Max(1, [Math]::Min(2000, $el.Height)))
+        $script:numModulo.Value    = [decimal]([Math]::Max(1, [Math]::Min(10,   $el.Module)))
+        $script:chkMostrar.Checked = [bool]$el.ShowText
+        $script:lblTipoSel.Text    = "Seleccionado: $($el.Type)"
+        $script:chkMostrar.Enabled = ($el.Type -eq "Barcode")
+        $script:numModulo.Enabled  = ($el.Type -eq "Barcode" -or $el.Type -eq "QR")
     }
     else {
         $script:lblTipoSel.Text = "Seleccionado: (ninguno)"
@@ -203,11 +318,12 @@ function Select-Elemento($el) {
 }
 
 function New-Elemento($tipo) {
-    $el = @{ Type = $tipo; X = 20; Y = 20; Text = ""; Height = 30; Module = 2; ShowText = $true; Ctrl = $null }
+    $el = @{ Type = $tipo; X = 20; Y = 20; Text = ""; Height = 45; Module = 2; ShowText = $true; Ctrl = $null }
     switch ($tipo) {
         "Texto"   { $el.Text = "Texto";              $el.Height = 45 }
         "Barcode" { $el.Text = "123456789";          $el.Height = 140; $el.Module = 3 }
         "QR"      { $el.Text = "https://ejemplo.com"; $el.Height = 200; $el.Module = 6 }
+        "Emoji"   { $el.Text = [char]::ConvertFromUtf32(0x2B50); $el.Height = 150 }  # estrella por defecto
     }
     if ($tipo -eq "Texto") {
         $c = New-Object System.Windows.Forms.Label
@@ -217,7 +333,9 @@ function New-Elemento($tipo) {
     else {
         $c = New-Object System.Windows.Forms.Panel
         $c.BackColor = [System.Drawing.Color]::White
-        if ($tipo -eq "Barcode") { $c.Add_Paint($BarcodePaint) } else { $c.Add_Paint($QrPaint) }
+        if ($tipo -eq "Barcode") { $c.Add_Paint($BarcodePaint) }
+        elseif ($tipo -eq "Emoji") { $c.Add_Paint($EmojiPaint) }
+        else { $c.Add_Paint($QrPaint) }
     }
     $c.Tag = $el
     $el.Ctrl = $c
@@ -231,14 +349,14 @@ function New-Elemento($tipo) {
 }
 
 # ============================================================
-#  GENERAR ZPL DESDE EL DISENO
+#  GENERAR ZPL
 # ============================================================
 function Generar-ZPL {
     $sb = New-Object System.Text.StringBuilder
     [void]$sb.AppendLine("^XA")
-    [void]$sb.AppendLine("^CI28")                       # UTF-8 (acentos)
-    [void]$sb.AppendLine("^PW$([int]$script:labelW)")   # ancho de impresion
-    [void]$sb.AppendLine("^LL$([int]$script:labelH)")   # largo de etiqueta
+    [void]$sb.AppendLine("^CI28")
+    [void]$sb.AppendLine("^PW$([int]$script:labelW)")
+    [void]$sb.AppendLine("^LL$([int]$script:labelH)")
     foreach ($el in $script:elementos) {
         $x = [int]$el.X
         $y = [int]$el.Y
@@ -254,9 +372,12 @@ function Generar-ZPL {
             if ($el.ShowText) { $line = 'Y' }
             [void]$sb.AppendLine("^FO$x,$y^BY$by^BCN,$h,$line,N,N^FD$($el.Text)^FS")
         }
-        else {  # QR
+        elseif ($el.Type -eq "QR") {
             $mag = [int]$el.Module
             [void]$sb.AppendLine("^FO$x,$y^BQN,2,$mag^FDQA,$($el.Text)^FS")
+        }
+        elseif ($el.Type -eq "Emoji") {
+            [void]$sb.AppendLine((Emoji-ToZpl $el.Text $el.Height $x $y))
         }
     }
     [void]$sb.AppendLine("^XZ")
@@ -264,7 +385,7 @@ function Generar-ZPL {
 }
 
 # ============================================================
-#  FORMULARIO PRINCIPAL
+#  FORMULARIO
 # ============================================================
 $form = New-Object System.Windows.Forms.Form
 $form.Text          = "Disenador de etiquetas ZPL"
@@ -286,10 +407,7 @@ $tabEnviar = New-Object System.Windows.Forms.TabPage
 $tabEnviar.Text = "Enviar"
 $tabs.TabPages.Add($tabEnviar)
 
-# ------------------------------------------------------------
-#  PESTANA: DISENAR
-# ------------------------------------------------------------
-# Tamano de etiqueta
+# -------- PESTANA DISENAR --------
 $lblW = New-Object System.Windows.Forms.Label
 $lblW.Text = "Ancho (dots):"
 $lblW.Location = New-Object System.Drawing.Point(10, 12)
@@ -334,14 +452,12 @@ $cboPreset.Location = New-Object System.Drawing.Point(440, 9)
 $cboPreset.Size = New-Object System.Drawing.Size(80, 22)
 $tabDiseno.Controls.Add($cboPreset)
 
-# Lienzo
 $script:panelCanvas = New-Object System.Windows.Forms.Panel
 $script:panelCanvas.Location = New-Object System.Drawing.Point(10, 42)
 $script:panelCanvas.BackColor = [System.Drawing.Color]::White
 $script:panelCanvas.BorderStyle = "FixedSingle"
 $tabDiseno.Controls.Add($script:panelCanvas)
 
-# Columna derecha: herramientas
 $colX = 400
 
 $btnAddTexto = New-Object System.Windows.Forms.Button
@@ -362,53 +478,58 @@ $btnAddQR.Location = New-Object System.Drawing.Point($colX, 106)
 $btnAddQR.Size = New-Object System.Drawing.Size(115, 28)
 $tabDiseno.Controls.Add($btnAddQR)
 
+$btnAddEmoji = New-Object System.Windows.Forms.Button
+$btnAddEmoji.Text = "+ Emoji"
+$btnAddEmoji.Location = New-Object System.Drawing.Point($colX, 138)
+$btnAddEmoji.Size = New-Object System.Drawing.Size(115, 28)
+$tabDiseno.Controls.Add($btnAddEmoji)
+
 $btnEliminar = New-Object System.Windows.Forms.Button
 $btnEliminar.Text = "Eliminar"
-$btnEliminar.Location = New-Object System.Drawing.Point($colX, 138)
+$btnEliminar.Location = New-Object System.Drawing.Point($colX, 170)
 $btnEliminar.Size = New-Object System.Drawing.Size(115, 28)
 $tabDiseno.Controls.Add($btnEliminar)
 
-# Grupo de propiedades
 $grp = New-Object System.Windows.Forms.GroupBox
 $grp.Text = "Propiedades"
-$grp.Location = New-Object System.Drawing.Point(10, 332)
-$grp.Size = New-Object System.Drawing.Size(505, 168)
+$grp.Location = New-Object System.Drawing.Point(10, 342)
+$grp.Size = New-Object System.Drawing.Size(505, 162)
 $tabDiseno.Controls.Add($grp)
 
 $script:lblTipoSel = New-Object System.Windows.Forms.Label
 $script:lblTipoSel.Text = "Seleccionado: (ninguno)"
-$script:lblTipoSel.Location = New-Object System.Drawing.Point(12, 22)
+$script:lblTipoSel.Location = New-Object System.Drawing.Point(12, 20)
 $script:lblTipoSel.Size = New-Object System.Drawing.Size(300, 18)
 $grp.Controls.Add($script:lblTipoSel)
 
 $lblCont = New-Object System.Windows.Forms.Label
 $lblCont.Text = "Contenido:"
-$lblCont.Location = New-Object System.Drawing.Point(12, 50)
+$lblCont.Location = New-Object System.Drawing.Point(12, 46)
 $lblCont.Size = New-Object System.Drawing.Size(75, 18)
 $grp.Controls.Add($lblCont)
 
 $script:txtContenido = New-Object System.Windows.Forms.TextBox
-$script:txtContenido.Location = New-Object System.Drawing.Point(90, 47)
+$script:txtContenido.Location = New-Object System.Drawing.Point(90, 43)
 $script:txtContenido.Size = New-Object System.Drawing.Size(400, 22)
 $grp.Controls.Add($script:txtContenido)
 
 $lblAlt = New-Object System.Windows.Forms.Label
 $lblAlt.Text = "Altura (dots):"
-$lblAlt.Location = New-Object System.Drawing.Point(12, 82)
+$lblAlt.Location = New-Object System.Drawing.Point(12, 78)
 $lblAlt.Size = New-Object System.Drawing.Size(85, 18)
 $grp.Controls.Add($lblAlt)
 
 $script:numAltura = New-Object System.Windows.Forms.NumericUpDown
 $script:numAltura.Minimum = 1
 $script:numAltura.Maximum = 2000
-$script:numAltura.Value = 30
-$script:numAltura.Location = New-Object System.Drawing.Point(100, 80)
+$script:numAltura.Value = 45
+$script:numAltura.Location = New-Object System.Drawing.Point(100, 76)
 $script:numAltura.Size = New-Object System.Drawing.Size(70, 22)
 $grp.Controls.Add($script:numAltura)
 
 $lblMod = New-Object System.Windows.Forms.Label
 $lblMod.Text = "Modulo/Mag:"
-$lblMod.Location = New-Object System.Drawing.Point(190, 82)
+$lblMod.Location = New-Object System.Drawing.Point(190, 78)
 $lblMod.Size = New-Object System.Drawing.Size(85, 18)
 $grp.Controls.Add($lblMod)
 
@@ -416,40 +537,37 @@ $script:numModulo = New-Object System.Windows.Forms.NumericUpDown
 $script:numModulo.Minimum = 1
 $script:numModulo.Maximum = 10
 $script:numModulo.Value = 2
-$script:numModulo.Location = New-Object System.Drawing.Point(278, 80)
+$script:numModulo.Location = New-Object System.Drawing.Point(278, 76)
 $script:numModulo.Size = New-Object System.Drawing.Size(55, 22)
 $grp.Controls.Add($script:numModulo)
 
 $script:chkMostrar = New-Object System.Windows.Forms.CheckBox
 $script:chkMostrar.Text = "Mostrar texto (barras)"
 $script:chkMostrar.Checked = $true
-$script:chkMostrar.Location = New-Object System.Drawing.Point(350, 81)
+$script:chkMostrar.Location = New-Object System.Drawing.Point(350, 77)
 $script:chkMostrar.Size = New-Object System.Drawing.Size(150, 22)
 $grp.Controls.Add($script:chkMostrar)
 
 $btnAplicarEl = New-Object System.Windows.Forms.Button
 $btnAplicarEl.Text = "Aplicar cambios"
-$btnAplicarEl.Location = New-Object System.Drawing.Point(90, 115)
+$btnAplicarEl.Location = New-Object System.Drawing.Point(90, 110)
 $btnAplicarEl.Size = New-Object System.Drawing.Size(120, 28)
 $grp.Controls.Add($btnAplicarEl)
 
 $script:lblPos = New-Object System.Windows.Forms.Label
 $script:lblPos.Text = "X: -  Y: - dots"
-$script:lblPos.Location = New-Object System.Drawing.Point(230, 121)
+$script:lblPos.Location = New-Object System.Drawing.Point(230, 116)
 $script:lblPos.Size = New-Object System.Drawing.Size(160, 18)
 $grp.Controls.Add($script:lblPos)
 
-# Generar ZPL
 $btnGenerar = New-Object System.Windows.Forms.Button
 $btnGenerar.Text = "Generar ZPL  ->  Enviar"
 $btnGenerar.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
-$btnGenerar.Location = New-Object System.Drawing.Point(10, 510)
+$btnGenerar.Location = New-Object System.Drawing.Point(10, 512)
 $btnGenerar.Size = New-Object System.Drawing.Size(505, 34)
 $tabDiseno.Controls.Add($btnGenerar)
 
-# ------------------------------------------------------------
-#  PESTANA: ENVIAR
-# ------------------------------------------------------------
+# -------- PESTANA ENVIAR --------
 $lblIp = New-Object System.Windows.Forms.Label
 $lblIp.Text = "IP de la impresora:"
 $lblIp.Location = New-Object System.Drawing.Point(10, 12)
@@ -580,6 +698,7 @@ $cboPreset.Add_SelectedIndexChanged({
 $btnAddTexto.Add_Click({ New-Elemento "Texto" })
 $btnAddBarcode.Add_Click({ New-Elemento "Barcode" })
 $btnAddQR.Add_Click({ New-Elemento "QR" })
+$btnAddEmoji.Add_Click({ New-Elemento "Emoji" })
 
 $btnEliminar.Add_Click({
     if ($script:selected -ne $null) {
