@@ -163,20 +163,25 @@ $BarcodePaint = {
     $g.Clear([System.Drawing.Color]::White)
     $el = $s.Tag
     $mods = Get-C128Modules "$($el.Text)"
-    $modPx = [Math]::Max(1, [int][Math]::Round($el.Module * $script:scale))
+    $modW = $el.Module * $script:scale          # ancho REAL de un modulo en px (puede ser < 1)
     $textArea = 2
-    if ($el.ShowText) { $textArea = 14 }
+    if ($el.ShowText) { $textArea = 12 }
     $barH = $s.Height - $textArea
     if ($barH -lt 4) { $barH = 4 }
-    $x = 10 * $modPx
+    $x = 0.0
     foreach ($m in $mods) {
-        $wpx = $m.w * $modPx
-        if ($m.bar) { $g.FillRectangle([System.Drawing.Brushes]::Black, $x, 0, $wpx, $barH) }
-        $x += $wpx
+        $w = $m.w * $modW
+        if ($m.bar) {
+            $x0 = [int][Math]::Round($x)
+            $x1 = [int][Math]::Round($x + $w)
+            $bw = $x1 - $x0
+            if ($bw -ge 1) { $g.FillRectangle([System.Drawing.Brushes]::Black, $x0, 0, $bw, $barH) }
+        }
+        $x += $w
     }
     if ($el.ShowText) {
         $f = New-Object System.Drawing.Font("Consolas", 7)
-        $g.DrawString("$($el.Text)", $f, [System.Drawing.Brushes]::Black, (10 * $modPx), ($s.Height - 12))
+        $g.DrawString("$($el.Text)", $f, [System.Drawing.Brushes]::Black, 0, ($s.Height - 11))
         $f.Dispose()
     }
 }
@@ -274,13 +279,13 @@ function Recalcular-Scale {
 function Refresh-Control($el) {
     $c = $el.Ctrl
     if ($el.Type -eq "Texto") {
-        $pt = [Math]::Round($el.Height * $script:scale * 0.75)
+        $pt = [Math]::Round($el.Height * $script:scale)
         if ($pt -lt 6) { $pt = 6 }
         $c.Font = New-Object System.Drawing.Font("Arial", $pt, [System.Drawing.FontStyle]::Bold)
         $c.Text = $el.Text
     }
     elseif ($el.Type -eq "Parrafo") {
-        $pt = [Math]::Round($el.Height * $script:scale * 0.75)
+        $pt = [Math]::Round($el.Height * $script:scale)
         if ($pt -lt 6) { $pt = 6 }
         $bw = [int]($el.BlockW * $script:scale)
         if ($bw -lt 30) { $bw = 30 }
@@ -292,10 +297,12 @@ function Refresh-Control($el) {
         $mods = Get-C128Modules "$($el.Text)"
         $units = 0
         foreach ($m in $mods) { $units += $m.w }
-        $modPx = [Math]::Max(1, [int][Math]::Round($el.Module * $script:scale))
-        $c.Width  = ($units + 20) * $modPx
+        $modW = $el.Module * $script:scale
+        $barsW = [int][Math]::Ceiling($units * $modW)   # ancho real de las barras en px
+        if ($barsW -lt 8) { $barsW = 8 }
+        $c.Width  = $barsW + 1
         $extra = 4
-        if ($el.ShowText) { $extra = 16 }
+        if ($el.ShowText) { $extra = 14 }
         $c.Height = [int]($el.Height * $script:scale) + $extra
         $c.Invalidate()
     }
