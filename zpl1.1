@@ -17,14 +17,14 @@ $Enc = [System.Text.Encoding]::GetEncoding(28591)   # Latin1: preserva bytes del
 $script:elementos = New-Object System.Collections.ArrayList
 $script:selected  = $null
 $script:scale     = 1.0
-$script:labelW    = 832      # 4" x 304dpi (PRINT WIDTH de la impresora)
-$script:labelH    = 1228     # 6" x 304dpi (LABEL LENGTH de la impresora)
+$script:labelW    = 832      # 4" x 203dpi (PRINT WIDTH de la impresora)
+$script:labelH    = 1228     # 6" x 203dpi (LABEL LENGTH de la impresora)
 $script:dragging  = $false
 $script:dragOffX  = 0
 $script:dragOffY  = 0
 $script:snap      = $false
 $script:gridDots  = 20
-$script:fontCal   = 0.75     # calibracion de la letra del preview vs impresion
+$script:fontCal   = 0.80     # calibracion de la letra del preview vs impresion
 
 # ------------------------------------------------------------
 #  TABLA DE PATRONES CODE128 (valor 0..106 -> anchos de modulos)
@@ -279,7 +279,7 @@ function Refresh-Control($el) {
     if ($el.Type -eq "Texto") {
         $pt = [Math]::Round($el.Height * $script:scale * $script:fontCal)
         if ($pt -lt 6) { $pt = 6 }
-        $c.Font = New-Object System.Drawing.Font("Arial", $pt, [System.Drawing.FontStyle]::Bold)
+        $c.Font = New-Object System.Drawing.Font("Arial", $pt)
         $c.Text = $el.Text
     }
     elseif ($el.Type -eq "Parrafo") {
@@ -468,15 +468,13 @@ function Generar-ZPL {
         $y = [int]$el.Y
         if ($el.Type -eq "Texto") {
             $h = [int]$el.Height
-            $w = [int]($h * 0.6)
-            [void]$sb.AppendLine("^FO$x,$y^A0N,$h,$w^FD$($el.Text)^FS")
+            [void]$sb.AppendLine("^FO$x,$y^A0N,$h^FD$($el.Text)^FS")
         }
         elseif ($el.Type -eq "Parrafo") {
             $h = [int]$el.Height
-            $w = [int]($h * 0.6)
             $bw = [int]$el.BlockW
             $body = ("$($el.Text)") -replace "`r`n", '\&' -replace "`n", '\&' -replace "`r", '\&'
-            [void]$sb.AppendLine("^FO$x,$y^A0N,$h,$w^FB$bw,50,0,L,0^FD$body^FS")
+            [void]$sb.AppendLine("^FO$x,$y^A0N,$h^FB$bw,50,0,L,0^FD$body^FS")
         }
         elseif ($el.Type -eq "Barcode") {
             $h = [int]$el.Height
@@ -559,7 +557,7 @@ $tabDiseno.Controls.Add($lblPreset)
 
 $cboPreset = New-Object System.Windows.Forms.ComboBox
 $cboPreset.DropDownStyle = "DropDownList"
-$cboPreset.Items.AddRange(@("4x6 304", "4x6 203", "3x2 304", "2x1 304"))
+$cboPreset.Items.AddRange(@("4x6", "3x2", "2x1"))
 $cboPreset.SelectedIndex = 0
 $cboPreset.Location = New-Object System.Drawing.Point(440, 9)
 $cboPreset.Size = New-Object System.Drawing.Size(80, 22)
@@ -630,7 +628,7 @@ $tabDiseno.Controls.Add($lblCal)
 $script:numCal = New-Object System.Windows.Forms.NumericUpDown
 $script:numCal.Minimum = 30
 $script:numCal.Maximum = 200
-$script:numCal.Value = 75
+$script:numCal.Value = 80
 $script:numCal.Increment = 5
 $script:numCal.Location = New-Object System.Drawing.Point(($colX + 54), 297)
 $script:numCal.Size = New-Object System.Drawing.Size(56, 22)
@@ -849,10 +847,9 @@ $btnTam.Add_Click({
 
 $cboPreset.Add_SelectedIndexChanged({
     switch ($cboPreset.SelectedItem) {
-        "4x6 304" { $script:labelW = 832;  $script:labelH = 1228 }
-        "4x6 203" { $script:labelW = 812;  $script:labelH = 1218 }
-        "3x2 304" { $script:labelW = 912;  $script:labelH = 608 }
-        "2x1 304" { $script:labelW = 608;  $script:labelH = 304 }
+        "4x6" { $script:labelW = 832; $script:labelH = 1228 }
+        "3x2" { $script:labelW = 609; $script:labelH = 406 }
+        "2x1" { $script:labelW = 406; $script:labelH = 203 }
     }
     $txtW.Text = "$script:labelW"
     $txtH.Text = "$script:labelH"
