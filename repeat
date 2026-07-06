@@ -48,6 +48,10 @@ public class RepeatForm : Form
     DateTime f8UltimoDisparo = DateTime.MinValue;
     bool escEnEjecucion = false;
 
+    // Evita que SendKeys.SendWait (que bombea mensajes de Windows mientras
+    // espera) dispare el Tick de nuevo desde adentro de si mismo.
+    bool procesando = false;
+
     const int VK_F8  = 0x77;
     const int VK_ESC = 0x1B;
 
@@ -155,6 +159,8 @@ public class RepeatForm : Form
 
     void Tick(object s, EventArgs e)
     {
+        if (procesando) return;
+
         // Hotkey F8 -> iniciar (funciona aunque otra ventana este enfocada)
         bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
         if (f8Down && !f8EnEjecucion)
@@ -181,6 +187,7 @@ public class RepeatForm : Form
 
         if (DateTime.Now >= proximaAccion)
         {
+            procesando = true;
             try
             {
                 SendKeys.SendWait("^v");
@@ -191,6 +198,10 @@ public class RepeatForm : Form
                 }
             }
             catch { }
+            finally
+            {
+                procesando = false;
+            }
 
             restantes--;
             lblEstado.Text = "Repitiendo: " + (total - restantes) + " / " + total;
