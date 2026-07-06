@@ -1,0 +1,269 @@
+# ================================
+# CHAT - CLIENTE
+# Escucha pasivamente (UDP) la invitacion del servidor.
+# Al recibirla, se conecta (TCP) al servidor y habilita el chat.
+# La IP del servidor se toma del propio paquete UDP recibido (no hace
+# falta que el servidor "adivine" su IP correcta entre varias tarjetas de red).
+# PowerShell 5.1 compatible
+# ================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Console {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32Console]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32Console]::ShowWindow($h, 0) }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Windows.Forms;
+using System.Drawing;
+
+public class ChatClientForm : Form
+{
+    TextBox txtPuertoUdp;
+    Button btnEscuchar;
+    Label lblEstado;
+
+    TextBox txtChatLog;
+    TextBox txtMensaje;
+    Button btnEnviar;
+
+    UdpClient udpEscucha;
+    TcpClient tcpServidor;
+    NetworkStream flujo;
+
+    int puertoUdp = 9500;
+
+    public ChatClientForm()
+    {
+        Text = "Chat - Cliente";
+        Width = 420;
+        Height = 480;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        Label lblUdp = new Label();
+        lblUdp.Text = "Puerto UDP (esperar invitacion):";
+        lblUdp.AutoSize = true;
+        lblUdp.Location = new Point(10, 12);
+
+        txtPuertoUdp = new TextBox();
+        txtPuertoUdp.Text = puertoUdp.ToString();
+        txtPuertoUdp.Location = new Point(200, 9);
+        txtPuertoUdp.Width = 70;
+
+        btnEscuchar = new Button();
+        btnEscuchar.Text = "Escuchar";
+        btnEscuchar.Location = new Point(280, 8);
+        btnEscuchar.Width = 110;
+        btnEscuchar.Click += delegate { EmpezarEscucha(); };
+
+        lblEstado = new Label();
+        lblEstado.Text = "Detenido.";
+        lblEstado.AutoSize = false;
+        lblEstado.Width = 380;
+        lblEstado.Height = 18;
+        lblEstado.Location = new Point(10, 40);
+        lblEstado.ForeColor = Color.DimGray;
+
+        txtChatLog = new TextBox();
+        txtChatLog.Multiline = true;
+        txtChatLog.ScrollBars = ScrollBars.Vertical;
+        txtChatLog.ReadOnly = true;
+        txtChatLog.Location = new Point(10, 65);
+        txtChatLog.Width = 380;
+        txtChatLog.Height = 300;
+
+        txtMensaje = new TextBox();
+        txtMensaje.Location = new Point(10, 375);
+        txtMensaje.Width = 280;
+        txtMensaje.Enabled = false;
+        txtMensaje.KeyDown += delegate(object s, KeyEventArgs e) {
+            if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; EnviarMensaje(); }
+        };
+
+        btnEnviar = new Button();
+        btnEnviar.Text = "Enviar";
+        btnEnviar.Location = new Point(298, 373);
+        btnEnviar.Width = 92;
+        btnEnviar.Enabled = false;
+        btnEnviar.Click += delegate { EnviarMensaje(); };
+
+        Controls.Add(lblUdp);
+        Controls.Add(txtPuertoUdp);
+        Controls.Add(btnEscuchar);
+        Controls.Add(lblEstado);
+        Controls.Add(txtChatLog);
+        Controls.Add(txtMensaje);
+        Controls.Add(btnEnviar);
+
+        EmpezarEscucha();
+    }
+
+    void EmpezarEscucha()
+    {
+        try
+        {
+            int.TryParse(txtPuertoUdp.Text.Trim(), out puertoUdp);
+            udpEscucha = new UdpClient(puertoUdp);
+            udpEscucha.BeginReceive(OnInvitacionRecibida, null);
+            lblEstado.Text = "Escuchando invitacion en el puerto UDP " + puertoUdp + "...";
+            btnEscuchar.Enabled = false;
+        }
+        catch (Exception ex)
+        {
+            lblEstado.Text = "Error al escuchar: " + ex.Message;
+        }
+    }
+
+    void OnInvitacionRecibida(IAsyncResult ar)
+    {
+        IPEndPoint remoto = new IPEndPoint(IPAddress.Any, 0);
+        byte[] datos;
+        try { datos = udpEscucha.EndReceive(ar, ref remoto); }
+        catch { return; }
+
+        string msg = Encoding.UTF8.GetString(datos).Trim();
+
+        if (msg.StartsWith("CONNECT:"))
+        {
+            int puertoTcp;
+            if (int.TryParse(msg.Substring(8), out puertoTcp))
+            {
+                string ipServidor = remoto.Address.ToString();
+                ConectarAlServidor(ipServidor, puertoTcp);
+                return;
+            }
+        }
+
+        try { udpEscucha.BeginReceive(OnInvitacionRecibida, null); } catch { }
+    }
+
+    void ConectarAlServidor(string ip, int puerto)
+    {
+        ActualizarEstado("Conectando a " + ip + ":" + puerto + " ...");
+        try
+        {
+            tcpServidor = new TcpClient();
+            tcpServidor.BeginConnect(ip, puerto, OnConectado, null);
+        }
+        catch (Exception ex)
+        {
+            ActualizarEstado("Error al conectar: " + ex.Message);
+        }
+    }
+
+    void OnConectado(IAsyncResult ar)
+    {
+        try
+        {
+            tcpServidor.EndConnect(ar);
+            flujo = tcpServidor.GetStream();
+
+            ActualizarEstado("Conectado al servidor " +
+                ((IPEndPoint)tcpServidor.Client.RemoteEndPoint).Address);
+            HabilitarEnvio(true);
+
+            byte[] buffer = new byte[4096];
+            flujo.BeginRead(buffer, 0, buffer.Length, OnDatosRecibidos, buffer);
+        }
+        catch (Exception ex)
+        {
+            ActualizarEstado("No se pudo conectar: " + ex.Message);
+        }
+    }
+
+    void OnDatosRecibidos(IAsyncResult ar)
+    {
+        byte[] buffer = (byte[])ar.AsyncState;
+        int leidos;
+        try { leidos = flujo.EndRead(ar); }
+        catch { leidos = 0; }
+
+        if (leidos <= 0)
+        {
+            ActualizarEstado("Se perdio la conexion con el servidor.");
+            HabilitarEnvio(false);
+            return;
+        }
+
+        string texto = Encoding.UTF8.GetString(buffer, 0, leidos).Trim();
+        if (texto.Length > 0) AgregarLog(texto);
+
+        try { flujo.BeginRead(buffer, 0, buffer.Length, OnDatosRecibidos, buffer); }
+        catch
+        {
+            ActualizarEstado("Se perdio la conexion con el servidor.");
+            HabilitarEnvio(false);
+        }
+    }
+
+    void EnviarMensaje()
+    {
+        string texto = txtMensaje.Text.Trim();
+        if (texto.Length == 0 || flujo == null) return;
+        try
+        {
+            byte[] datos = Encoding.UTF8.GetBytes(texto + "\n");
+            flujo.Write(datos, 0, datos.Length);
+            AgregarLog("Yo: " + texto);
+            txtMensaje.Clear();
+        }
+        catch
+        {
+            ActualizarEstado("Se perdio la conexion con el servidor.");
+            HabilitarEnvio(false);
+        }
+    }
+
+    void AgregarLog(string texto)
+    {
+        if (InvokeRequired) { BeginInvoke(new Action<string>(AgregarLog), texto); return; }
+        txtChatLog.AppendText(texto + Environment.NewLine);
+    }
+
+    void ActualizarEstado(string texto)
+    {
+        if (InvokeRequired) { BeginInvoke(new Action<string>(ActualizarEstado), texto); return; }
+        lblEstado.Text = texto;
+    }
+
+    void HabilitarEnvio(bool habilitar)
+    {
+        if (InvokeRequired) { BeginInvoke(new Action<bool>(HabilitarEnvio), habilitar); return; }
+        txtMensaje.Enabled = habilitar;
+        btnEnviar.Enabled = habilitar;
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        try { udpEscucha.Close(); } catch { }
+        try { tcpServidor.Close(); } catch { }
+        base.OnFormClosed(e);
+    }
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new ChatClientForm());
+    }
+}
+"@
+
+# ARRANCAR
+[ChatClientForm]::Main()
