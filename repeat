@@ -32,6 +32,7 @@ public class RepeatForm : Form
     NumericUpDown numCantidad;
     NumericUpDown numEspera;
     CheckBox chkEnter;
+    TextBox txtContenido;
     Label lblEstado;
     Label lblAyuda;
     Button btnIniciar;
@@ -59,7 +60,7 @@ public class RepeatForm : Form
     {
         Text = "Repetidor Ctrl+V";
         Width = 300;
-        Height = 230;
+        Height = 350;
         TopMost = true;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
@@ -97,21 +98,34 @@ public class RepeatForm : Form
         chkEnter.AutoSize = true;
         chkEnter.Location = new Point(10, 75);
 
+        Label lblCont = new Label();
+        lblCont.Text = "Contenido (se copia al portapapeles al iniciar):";
+        lblCont.AutoSize = true;
+        lblCont.Location = new Point(10, 102);
+
+        txtContenido = new TextBox();
+        txtContenido.Multiline = true;
+        txtContenido.ScrollBars = ScrollBars.Vertical;
+        txtContenido.AcceptsReturn = true;
+        txtContenido.Location = new Point(10, 122);
+        txtContenido.Width = 260;
+        txtContenido.Height = 55;
+
         lblAyuda = new Label();
         lblAyuda.Text = "F8 = iniciar   |   Esc = detener\n(funcionan en cualquier ventana)";
         lblAyuda.AutoSize = true;
-        lblAyuda.Location = new Point(10, 105);
+        lblAyuda.Location = new Point(10, 185);
         lblAyuda.ForeColor = Color.DimGray;
 
         btnIniciar = new Button();
         btnIniciar.Text = "Iniciar";
-        btnIniciar.Location = new Point(10, 150);
+        btnIniciar.Location = new Point(10, 230);
         btnIniciar.Width = 125;
         btnIniciar.Click += delegate { Iniciar(); };
 
         btnDetener = new Button();
         btnDetener.Text = "Detener";
-        btnDetener.Location = new Point(145, 150);
+        btnDetener.Location = new Point(145, 230);
         btnDetener.Width = 125;
         btnDetener.Click += delegate { Detener("Detenido."); };
 
@@ -120,7 +134,7 @@ public class RepeatForm : Form
         lblEstado.AutoSize = false;
         lblEstado.Width = 260;
         lblEstado.Height = 20;
-        lblEstado.Location = new Point(10, 185);
+        lblEstado.Location = new Point(10, 265);
         lblEstado.Font = new Font("Arial", 9, FontStyle.Bold);
 
         Controls.Add(lblCant);
@@ -128,6 +142,8 @@ public class RepeatForm : Form
         Controls.Add(lblEsp);
         Controls.Add(numEspera);
         Controls.Add(chkEnter);
+        Controls.Add(lblCont);
+        Controls.Add(txtContenido);
         Controls.Add(lblAyuda);
         Controls.Add(btnIniciar);
         Controls.Add(btnDetener);
@@ -142,6 +158,11 @@ public class RepeatForm : Form
     void Iniciar()
     {
         if (activo) return;
+
+        if (!string.IsNullOrEmpty(txtContenido.Text))
+        {
+            try { Clipboard.SetText(txtContenido.Text); } catch { }
+        }
 
         total = (int)numCantidad.Value;
         restantes = total;
