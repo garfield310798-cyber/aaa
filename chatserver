@@ -1,0 +1,352 @@
+# ================================
+# CHAT - SERVIDOR
+# El servidor invita a los clientes (UDP) a que se conecten (TCP) a el.
+# Los clientes escuchan pasivamente hasta recibir la invitacion.
+# Retransmite los mensajes de cada cliente a todos los demas (chat grupal).
+# PowerShell 5.1 compatible
+# ================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Console {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32Console]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32Console]::ShowWindow($h, 0) }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Windows.Forms;
+using System.Drawing;
+
+public class ChatServerForm : Form
+{
+    TextBox txtIPs;
+    TextBox txtPuertoUdp;
+    TextBox txtPuertoTcp;
+    Button btnInvitar;
+    ListBox lstClientes;
+    TextBox txtChatLog;
+    TextBox txtMensaje;
+    Button btnEnviar;
+    Label lblEstado;
+
+    TcpListener listener;
+    UdpClient udpInvitador;
+
+    object lockClientes = new object();
+    Dictionary<string, TcpClient> clientes = new Dictionary<string, TcpClient>();
+
+    int puertoTcp = 9600;
+    int puertoUdp = 9500;
+
+    public ChatServerForm()
+    {
+        Text = "Chat - Servidor";
+        Width = 540;
+        Height = 600;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        Label lblIPs = new Label();
+        lblIPs.Text = "IPs de clientes (una por linea):";
+        lblIPs.AutoSize = true;
+        lblIPs.Location = new Point(10, 10);
+
+        txtIPs = new TextBox();
+        txtIPs.Multiline = true;
+        txtIPs.ScrollBars = ScrollBars.Vertical;
+        txtIPs.Location = new Point(10, 30);
+        txtIPs.Width = 220;
+        txtIPs.Height = 80;
+
+        Label lblUdp = new Label();
+        lblUdp.Text = "Puerto UDP (invitacion):";
+        lblUdp.AutoSize = true;
+        lblUdp.Location = new Point(245, 10);
+
+        txtPuertoUdp = new TextBox();
+        txtPuertoUdp.Text = puertoUdp.ToString();
+        txtPuertoUdp.Location = new Point(245, 30);
+        txtPuertoUdp.Width = 80;
+
+        Label lblTcp = new Label();
+        lblTcp.Text = "Puerto TCP (chat):";
+        lblTcp.AutoSize = true;
+        lblTcp.Location = new Point(245, 60);
+
+        txtPuertoTcp = new TextBox();
+        txtPuertoTcp.Text = puertoTcp.ToString();
+        txtPuertoTcp.Location = new Point(245, 80);
+        txtPuertoTcp.Width = 80;
+
+        btnInvitar = new Button();
+        btnInvitar.Text = "Invitar clientes";
+        btnInvitar.Location = new Point(340, 30);
+        btnInvitar.Width = 170;
+        btnInvitar.Click += delegate { InvitarClientes(); };
+
+        Label lblConectados = new Label();
+        lblConectados.Text = "Clientes conectados:";
+        lblConectados.AutoSize = true;
+        lblConectados.Location = new Point(10, 118);
+
+        lstClientes = new ListBox();
+        lstClientes.Location = new Point(10, 138);
+        lstClientes.Width = 500;
+        lstClientes.Height = 70;
+
+        txtChatLog = new TextBox();
+        txtChatLog.Multiline = true;
+        txtChatLog.ScrollBars = ScrollBars.Vertical;
+        txtChatLog.ReadOnly = true;
+        txtChatLog.Location = new Point(10, 218);
+        txtChatLog.Width = 500;
+        txtChatLog.Height = 250;
+
+        txtMensaje = new TextBox();
+        txtMensaje.Location = new Point(10, 478);
+        txtMensaje.Width = 400;
+        txtMensaje.KeyDown += delegate(object s, KeyEventArgs e) {
+            if (e.KeyCode == Keys.Enter) { e.SuppressKeyPress = true; EnviarMensaje(); }
+        };
+
+        btnEnviar = new Button();
+        btnEnviar.Text = "Enviar";
+        btnEnviar.Location = new Point(418, 476);
+        btnEnviar.Width = 92;
+        btnEnviar.Click += delegate { EnviarMensaje(); };
+
+        lblEstado = new Label();
+        lblEstado.Text = "Servidor no iniciado.";
+        lblEstado.AutoSize = false;
+        lblEstado.Width = 500;
+        lblEstado.Height = 18;
+        lblEstado.Location = new Point(10, 510);
+        lblEstado.ForeColor = Color.DimGray;
+
+        Controls.Add(lblIPs);
+        Controls.Add(txtIPs);
+        Controls.Add(lblUdp);
+        Controls.Add(txtPuertoUdp);
+        Controls.Add(lblTcp);
+        Controls.Add(txtPuertoTcp);
+        Controls.Add(btnInvitar);
+        Controls.Add(lblConectados);
+        Controls.Add(lstClientes);
+        Controls.Add(txtChatLog);
+        Controls.Add(txtMensaje);
+        Controls.Add(btnEnviar);
+        Controls.Add(lblEstado);
+
+        IniciarServidor();
+    }
+
+    void IniciarServidor()
+    {
+        try
+        {
+            int.TryParse(txtPuertoTcp.Text.Trim(), out puertoTcp);
+            listener = new TcpListener(IPAddress.Any, puertoTcp);
+            listener.Start();
+            listener.BeginAcceptTcpClient(OnClienteConectado, null);
+            lblEstado.Text = "Escuchando conexiones TCP en el puerto " + puertoTcp + ".";
+        }
+        catch (Exception ex)
+        {
+            lblEstado.Text = "Error al iniciar el servidor: " + ex.Message;
+        }
+    }
+
+    void OnClienteConectado(IAsyncResult ar)
+    {
+        TcpClient cliente;
+        try { cliente = listener.EndAcceptTcpClient(ar); }
+        catch { return; }
+        finally
+        {
+            try { listener.BeginAcceptTcpClient(OnClienteConectado, null); } catch { }
+        }
+
+        string ip = ((IPEndPoint)cliente.Client.RemoteEndPoint).Address.ToString();
+
+        lock (lockClientes) { clientes[ip] = cliente; }
+
+        AgregarLog("[Sistema] Cliente conectado: " + ip);
+        ActualizarListaClientes();
+
+        byte[] buffer = new byte[4096];
+        object[] estado = new object[] { cliente, buffer, ip };
+        try
+        {
+            cliente.GetStream().BeginRead(buffer, 0, buffer.Length, OnDatosRecibidos, estado);
+        }
+        catch { }
+    }
+
+    void OnDatosRecibidos(IAsyncResult ar)
+    {
+        object[] estado = (object[])ar.AsyncState;
+        TcpClient cliente = (TcpClient)estado[0];
+        byte[] buffer = (byte[])estado[1];
+        string ip = (string)estado[2];
+
+        int leidos;
+        try { leidos = cliente.GetStream().EndRead(ar); }
+        catch { leidos = 0; }
+
+        if (leidos <= 0)
+        {
+            DesconectarCliente(ip);
+            return;
+        }
+
+        string texto = Encoding.UTF8.GetString(buffer, 0, leidos).Trim();
+        if (texto.Length > 0)
+        {
+            AgregarLog(ip + ": " + texto);
+            RetransmitirATodosMenos(ip, ip + ": " + texto);
+        }
+
+        try
+        {
+            cliente.GetStream().BeginRead(buffer, 0, buffer.Length, OnDatosRecibidos, estado);
+        }
+        catch { DesconectarCliente(ip); }
+    }
+
+    void DesconectarCliente(string ip)
+    {
+        lock (lockClientes)
+        {
+            if (clientes.ContainsKey(ip))
+            {
+                try { clientes[ip].Close(); } catch { }
+                clientes.Remove(ip);
+            }
+        }
+        AgregarLog("[Sistema] Cliente desconectado: " + ip);
+        ActualizarListaClientes();
+    }
+
+    void RetransmitirATodosMenos(string ipOrigen, string mensaje)
+    {
+        byte[] datos = Encoding.UTF8.GetBytes(mensaje + "\n");
+        List<string> caidos = new List<string>();
+        lock (lockClientes)
+        {
+            foreach (KeyValuePair<string, TcpClient> kv in clientes)
+            {
+                if (kv.Key == ipOrigen) continue;
+                try { kv.Value.GetStream().Write(datos, 0, datos.Length); }
+                catch { caidos.Add(kv.Key); }
+            }
+        }
+        foreach (string ip in caidos) DesconectarCliente(ip);
+    }
+
+    void EnviarATodos(string mensaje)
+    {
+        byte[] datos = Encoding.UTF8.GetBytes(mensaje + "\n");
+        List<string> caidos = new List<string>();
+        lock (lockClientes)
+        {
+            foreach (KeyValuePair<string, TcpClient> kv in clientes)
+            {
+                try { kv.Value.GetStream().Write(datos, 0, datos.Length); }
+                catch { caidos.Add(kv.Key); }
+            }
+        }
+        foreach (string ip in caidos) DesconectarCliente(ip);
+    }
+
+    void EnviarMensaje()
+    {
+        string texto = txtMensaje.Text.Trim();
+        if (texto.Length == 0) return;
+        AgregarLog("Yo (servidor): " + texto);
+        EnviarATodos("Servidor: " + texto);
+        txtMensaje.Clear();
+    }
+
+    void InvitarClientes()
+    {
+        try
+        {
+            int.TryParse(txtPuertoUdp.Text.Trim(), out puertoUdp);
+            int.TryParse(txtPuertoTcp.Text.Trim(), out puertoTcp);
+
+            string[] lineas = txtIPs.Text.Replace("\r", "").Split('\n');
+            udpInvitador = new UdpClient();
+            byte[] datos = Encoding.UTF8.GetBytes("CONNECT:" + puertoTcp);
+
+            int enviados = 0;
+            foreach (string linea in lineas)
+            {
+                string ip = linea.Trim();
+                if (ip.Length == 0) continue;
+                try
+                {
+                    udpInvitador.Send(datos, datos.Length, ip, puertoUdp);
+                    enviados++;
+                }
+                catch { }
+            }
+            lblEstado.Text = "Invitacion enviada a " + enviados + " cliente(s).";
+        }
+        catch (Exception ex)
+        {
+            lblEstado.Text = "Error al invitar: " + ex.Message;
+        }
+    }
+
+    void AgregarLog(string texto)
+    {
+        if (InvokeRequired) { BeginInvoke(new Action<string>(AgregarLog), texto); return; }
+        txtChatLog.AppendText(texto + Environment.NewLine);
+    }
+
+    void ActualizarListaClientes()
+    {
+        if (InvokeRequired) { BeginInvoke(new Action(ActualizarListaClientes)); return; }
+        lstClientes.Items.Clear();
+        lock (lockClientes)
+        {
+            foreach (string ip in clientes.Keys) lstClientes.Items.Add(ip);
+        }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        try { listener.Stop(); } catch { }
+        lock (lockClientes)
+        {
+            foreach (TcpClient c in clientes.Values) { try { c.Close(); } catch { } }
+        }
+        base.OnFormClosed(e);
+    }
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new ChatServerForm());
+    }
+}
+"@
+
+# ARRANCAR
+[ChatServerForm]::Main()
