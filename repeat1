@@ -1,0 +1,297 @@
+# ================================
+# REPETIDOR DE Ctrl+V + ENTER
+# F8 inicia la secuencia, Esc la detiene (funcionan aunque la ventana
+# activa sea otra app, igual que las flechas en conteo2.4)
+# PowerShell 5.1 compatible
+# ================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Console {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32Console]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32Console]::ShowWindow($h, 0) }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+using System.Drawing;
+
+public class RepeatForm : Form
+{
+    NumericUpDown numCantidad;
+    NumericUpDown numEspera;
+    CheckBox chkEnter;
+    TextBox txtContenido;
+    Label lblEstado;
+    Label lblAyuda;
+    Button btnIniciar;
+    Button btnDetener;
+
+    Timer timer;
+
+    bool activo = false;
+    int restantes = 0;
+    int total = 0;
+    DateTime proximaAccion = DateTime.MinValue;
+
+    bool f8EnEjecucion = false;
+    DateTime f8UltimoDisparo = DateTime.MinValue;
+    bool escEnEjecucion = false;
+    bool f9EnEjecucion = false;
+
+    // Controla si la ventana puede mostrarse. Arranca en false para que
+    // el formulario nunca aparezca al ejecutar (queda oculto en segundo plano).
+    bool permitirVisible = false;
+
+    // Evita que SendKeys.SendWait (que bombea mensajes de Windows mientras
+    // espera) dispare el Tick de nuevo desde adentro de si mismo.
+    bool procesando = false;
+
+    const int VK_F8  = 0x77;
+    const int VK_ESC = 0x1B;
+    const int VK_F9  = 0x78;
+
+    public RepeatForm()
+    {
+        Text = "Repetidor Ctrl+V";
+        Width = 300;
+        Height = 350;
+        TopMost = true;
+        FormBorderStyle = FormBorderStyle.FixedDialog;
+        MaximizeBox = false;
+        StartPosition = FormStartPosition.CenterScreen;
+
+        Label lblCant = new Label();
+        lblCant.Text = "Cantidad de repeticiones:";
+        lblCant.AutoSize = true;
+        lblCant.Location = new Point(10, 15);
+
+        numCantidad = new NumericUpDown();
+        numCantidad.Minimum = 1;
+        numCantidad.Maximum = 1000;
+        numCantidad.Value = 10;
+        numCantidad.Location = new Point(200, 12);
+        numCantidad.Width = 70;
+
+        Label lblEsp = new Label();
+        lblEsp.Text = "Espera entre cada una (seg):";
+        lblEsp.AutoSize = true;
+        lblEsp.Location = new Point(10, 45);
+
+        numEspera = new NumericUpDown();
+        numEspera.DecimalPlaces = 1;
+        numEspera.Increment = 0.1M;
+        numEspera.Minimum = 0.1M;
+        numEspera.Maximum = 60M;
+        numEspera.Value = 1M;
+        numEspera.Location = new Point(200, 42);
+        numEspera.Width = 70;
+
+        chkEnter = new CheckBox();
+        chkEnter.Text = "Presionar Enter despues de pegar";
+        chkEnter.Checked = true;
+        chkEnter.AutoSize = true;
+        chkEnter.Location = new Point(10, 75);
+
+        Label lblCont = new Label();
+        lblCont.Text = "Contenido (se copia al portapapeles al iniciar):";
+        lblCont.AutoSize = true;
+        lblCont.Location = new Point(10, 102);
+
+        txtContenido = new TextBox();
+        txtContenido.Multiline = true;
+        txtContenido.ScrollBars = ScrollBars.Vertical;
+        txtContenido.AcceptsReturn = true;
+        txtContenido.Location = new Point(10, 122);
+        txtContenido.Width = 260;
+        txtContenido.Height = 55;
+
+        lblAyuda = new Label();
+        lblAyuda.Text = "F8 = iniciar   |   Esc = detener\nF9 = mostrar / ocultar esta ventana\n(funcionan en cualquier ventana)";
+        lblAyuda.AutoSize = true;
+        lblAyuda.Location = new Point(10, 185);
+        lblAyuda.ForeColor = Color.DimGray;
+
+        btnIniciar = new Button();
+        btnIniciar.Text = "Iniciar";
+        btnIniciar.Location = new Point(10, 230);
+        btnIniciar.Width = 125;
+        btnIniciar.Click += delegate { Iniciar(); };
+
+        btnDetener = new Button();
+        btnDetener.Text = "Detener";
+        btnDetener.Location = new Point(145, 230);
+        btnDetener.Width = 125;
+        btnDetener.Click += delegate { Detener("Detenido."); };
+
+        lblEstado = new Label();
+        lblEstado.Text = "Listo.";
+        lblEstado.AutoSize = false;
+        lblEstado.Width = 260;
+        lblEstado.Height = 20;
+        lblEstado.Location = new Point(10, 265);
+        lblEstado.Font = new Font("Arial", 9, FontStyle.Bold);
+
+        Controls.Add(lblCant);
+        Controls.Add(numCantidad);
+        Controls.Add(lblEsp);
+        Controls.Add(numEspera);
+        Controls.Add(chkEnter);
+        Controls.Add(lblCont);
+        Controls.Add(txtContenido);
+        Controls.Add(lblAyuda);
+        Controls.Add(btnIniciar);
+        Controls.Add(btnDetener);
+        Controls.Add(lblEstado);
+
+        timer = new Timer();
+        timer.Interval = 50;
+        timer.Tick += Tick;
+        timer.Start();
+    }
+
+    // Mientras permitirVisible sea false, cualquier intento de mostrar el
+    // formulario (incluido el que hace Application.Run al arrancar) se ignora,
+    // pero el handle se crea igual para que el Timer y los hotkeys funcionen.
+    protected override void SetVisibleCore(bool value)
+    {
+        if (!permitirVisible)
+        {
+            if (!this.IsHandleCreated) { CreateHandle(); }
+            value = false;
+        }
+        base.SetVisibleCore(value);
+    }
+
+    void ToggleVentana()
+    {
+        permitirVisible = !permitirVisible;
+        if (permitirVisible)
+        {
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
+        }
+        else
+        {
+            Hide();
+        }
+    }
+
+    void Iniciar()
+    {
+        if (activo) return;
+
+        if (!string.IsNullOrEmpty(txtContenido.Text))
+        {
+            try { Clipboard.SetText(txtContenido.Text); } catch { }
+        }
+
+        total = (int)numCantidad.Value;
+        restantes = total;
+        activo = true;
+        proximaAccion = DateTime.Now; // dispara la primera ya en el siguiente tick
+        lblEstado.Text = "Iniciando...";
+    }
+
+    void Detener(string motivo)
+    {
+        activo = false;
+        restantes = 0;
+        lblEstado.Text = motivo;
+    }
+
+    void Tick(object s, EventArgs e)
+    {
+        if (procesando) return;
+
+        // Hotkey F8 -> iniciar (funciona aunque otra ventana este enfocada)
+        bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+        if (f8Down && !f8EnEjecucion)
+        {
+            if ((DateTime.Now - f8UltimoDisparo).TotalMilliseconds > 300)
+            {
+                f8EnEjecucion = true;
+                f8UltimoDisparo = DateTime.Now;
+                Iniciar();
+            }
+        }
+        else if (!f8Down) f8EnEjecucion = false;
+
+        // Hotkey Esc -> detener
+        bool escDown = (GetAsyncKeyState(VK_ESC) & 0x8000) != 0;
+        if (escDown && !escEnEjecucion)
+        {
+            escEnEjecucion = true;
+            if (activo) Detener("Detenido con Esc.");
+        }
+        else if (!escDown) escEnEjecucion = false;
+
+        // Hotkey F9 -> mostrar / ocultar la ventana
+        bool f9Down = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+        if (f9Down && !f9EnEjecucion)
+        {
+            f9EnEjecucion = true;
+            ToggleVentana();
+        }
+        else if (!f9Down) f9EnEjecucion = false;
+
+        if (!activo) return;
+
+        if (DateTime.Now >= proximaAccion)
+        {
+            procesando = true;
+            try
+            {
+                SendKeys.SendWait("^v");
+                if (chkEnter.Checked)
+                {
+                    System.Threading.Thread.Sleep(80);
+                    SendKeys.SendWait("{ENTER}");
+                }
+            }
+            catch { }
+            finally
+            {
+                procesando = false;
+            }
+
+            restantes--;
+            lblEstado.Text = "Repitiendo: " + (total - restantes) + " / " + total;
+
+            if (restantes <= 0)
+            {
+                Detener("Completado (" + total + ").");
+            }
+            else
+            {
+                double esperaMs = (double)numEspera.Value * 1000.0;
+                proximaAccion = DateTime.Now.AddMilliseconds(esperaMs);
+            }
+        }
+    }
+
+    [DllImport("user32.dll")] static extern short GetAsyncKeyState(int vKey);
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new RepeatForm());
+    }
+}
+"@
+
+# ARRANCAR
+[RepeatForm]::Main()
