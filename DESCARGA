@@ -1,0 +1,31 @@
+# ============================================================
+#  Instala el cliente de conteo oculto (descarga .ps1 + crea .vbs)
+#  Pega TODO esto en PowerShell y presiona Enter.
+# ============================================================
+$dest = "$env:USERPROFILE\Conteo"      # <-- carpeta destino (cambiala si quieres)
+
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+New-Item -ItemType Directory -Force -Path $dest | Out-Null
+
+$urlPs1  = 'https://raw.githubusercontent.com/garfield310798-cyber/aaa/main/cliente_oculto.ps1'
+$rutaPs1 = Join-Path $dest 'cliente_oculto.ps1'
+$rutaVbs = Join-Path $dest 'cliente_oculto.vbs'
+
+# 1) Descargar el script desde GitHub
+Invoke-WebRequest -Uri $urlPs1 -OutFile $rutaPs1 -UseBasicParsing
+try { Unblock-File -Path $rutaPs1 } catch {}   # quita el bloqueo "descargado de Internet"
+
+# 2) Crear el lanzador .vbs (sin ventana) apuntando al .ps1 de esta carpeta
+$vbs = @'
+Dim sh, ruta
+Set sh = CreateObject("WScript.Shell")
+ruta = CreateObject("Scripting.FileSystemObject").GetParentFolderName(WScript.ScriptFullName) & "\cliente_oculto.ps1"
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy RemoteSigned -File """ & ruta & """", 0, False
+'@
+Set-Content -Path $rutaVbs -Value $vbs -Encoding ASCII
+
+Write-Host ""
+Write-Host "Listo. Archivos en: $dest" -ForegroundColor Green
+Write-Host "  - cliente_oculto.ps1"
+Write-Host "  - cliente_oculto.vbs"
+Write-Host "Arranca con doble clic en cliente_oculto.vbs  (Ctrl+F10 muestra la ventana)."
