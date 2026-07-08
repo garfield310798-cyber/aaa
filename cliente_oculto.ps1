@@ -56,6 +56,7 @@ public class ClienteConteo : Form
     static int contador = 0;
     static string buffer = "";
     static bool ultimoFueECOM = false;
+    static DateTime ultimoF10 = DateTime.MinValue;   // anti-rebote del hotkey Ctrl+F10
     string modoActual = "Retail";
 
     static IntPtr hookID = IntPtr.Zero;
@@ -206,6 +207,10 @@ public class ClienteConteo : Form
 
         IniciarEscuchaUdp();
         ActualizarMetricas();
+
+        // Fuerza crear el handle (la ventana sigue oculta) para que el hotkey
+        // pueda usar BeginInvoke aunque el formulario nunca se haya mostrado.
+        { IntPtr forzarHandle = this.Handle; }
     }
 
     // ==========================
@@ -229,6 +234,7 @@ public class ClienteConteo : Form
         if (permitirVisible && Visible)
         {
             permitirVisible = false;
+            TopMost = false;
             Hide();
         }
         else
@@ -236,7 +242,9 @@ public class ClienteConteo : Form
             permitirVisible = true;
             Show();
             WindowState = FormWindowState.Normal;
+            TopMost = true;      // asegura que salga al frente aunque otra app tenga el foco
             Activate();
+            BringToFront();
         }
     }
 
@@ -388,12 +396,18 @@ public class ClienteConteo : Form
             // 0x79 = F10 ; 0x11 = Ctrl. El bit 0x8000 indica que la tecla esta abajo.
             if (k == 0x79 && (GetAsyncKeyState(0x11) & 0x8000) != 0)
             {
-                ClienteConteo f = Instancia;
-                if (f != null)
+                // Anti-rebote: ignora el autorepeat dentro de 400 ms, para que un
+                // toque de Ctrl+F10 haga UN solo mostrar/ocultar (y no termine oculta).
+                if ((DateTime.Now - ultimoF10).TotalMilliseconds >= 400)
                 {
-                    // Se difiere al hilo de UI: el hook debe responder rapido y no
-                    // conviene mostrar/activar la ventana dentro del propio callback.
-                    try { f.BeginInvoke((MethodInvoker)delegate { f.ToggleVentana(); }); } catch { }
+                    ultimoF10 = DateTime.Now;
+                    ClienteConteo f = Instancia;
+                    if (f != null)
+                    {
+                        // Se difiere al hilo de UI: el hook debe responder rapido y no
+                        // conviene mostrar/activar la ventana dentro del propio callback.
+                        try { f.BeginInvoke((MethodInvoker)delegate { f.ToggleVentana(); }); } catch { }
+                    }
                 }
                 return CallNextHookEx(hookID, nCode, w, l);
             }
@@ -552,6 +566,19 @@ public class ClienteConteo : Form
     // ==========================
     // Persistencia (archivo del dia)
     // ==========================
+    // Escribe el archivo y lo deja OCULTO. Como WriteAllLines falla si el
+    // destino ya esta oculto, primero se le quita el atributo, se escribe y
+    // luego se vuelve a marcar como oculto.
+    static void EscribirOculto(string ruta, string[] lineas)
+    {
+        if (File.Exists(ruta))
+        {
+            try { File.SetAttributes(ruta, FileAttributes.Normal); } catch { }
+        }
+        File.WriteAllLines(ruta, lineas);
+        try { File.SetAttributes(ruta, FileAttributes.Hidden); } catch { }
+    }
+
     void GuardarDia()
     {
         try
@@ -571,7 +598,7 @@ public class ClienteConteo : Form
                 lineas.Add(fecha + "," + modoActual + "," + hora + "," + v + "," +
                     cpm.ToString("0.00", CultureInfo.InvariantCulture) + "," + est);
             }
-            File.WriteAllLines(ArchivoDia, lineas.ToArray());
+            EscribirOculto(ArchivoDia, lineas.ToArray());
         }
         catch { }
     }
@@ -618,7 +645,7 @@ public class ClienteConteo : Form
             lineas.Add("Fecha,Hora,CPM,InactivoSeg");
             foreach (Muestra m in arr)
                 lineas.Add(fecha + "," + m.Hora + "," + m.Cpm.ToString("0.00", CultureInfo.InvariantCulture) + "," + m.Idle);
-            File.WriteAllLines(ArchMuestras, lineas.ToArray());
+            EscribirOculto(ArchMuestras, lineas.ToArray());
         }
         catch { }
     }
