@@ -1,6 +1,7 @@
 # ====================================================================
 # SCRIPT DE AUTOMATIZACIÓN DE INTERFAZ (BASADO EN SCRIPT DE CONTEO)
 # Utiliza GetAsyncKeyState en un temporizador para evitar bloqueos
+# + Filtro: compara lo copiado contra una lista (uno por línea) y avisa
 # ====================================================================
 
 Add-Type @"
@@ -24,6 +25,7 @@ using System;
 using System.Windows.Forms;
 using System.Runtime.InteropServices;
 using System.Drawing;
+using System.Media;
 
 public class AutoForm : Form
 {
@@ -31,27 +33,59 @@ public class AutoForm : Form
     private bool leftEnEjecucion = false;
     private DateTime leftUltimoDisparo = DateTime.MinValue;
 
+    // Controles de la interfaz
+    private Label lblStatus;
+    private TextBox txtFiltro;   // Filtro: un elemento por línea
+    private Label lblAlerta;     // Muestra el resultado de la comparación
+
     // Código de la tecla flecha izquierda (Misma que usa tu script de conteo)
     private const int VK_LEFT = 0x25;
 
     public AutoForm()
     {
-        // Crear una interfaz pequeña idéntica en comportamiento a la de conteo
+        // Ventana pequeña, siempre visible por encima del resto
         Text = "Auto Key";
-        Width = 200;
-        Height = 100;
+        ClientSize = new Size(320, 300);
         TopMost = true;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         MaximizeBox = false;
+        MinimizeBox = false;
         StartPosition = FormStartPosition.CenterScreen;
 
-        Label lblStatus = new Label();
+        // Estado (qué está escuchando)
+        lblStatus = new Label();
         lblStatus.Text = "Escuchando Flecha Izq...";
-        lblStatus.Dock = DockStyle.Fill;
         lblStatus.TextAlign = ContentAlignment.MiddleCenter;
+        lblStatus.Location = new Point(10, 8);
+        lblStatus.Size = new Size(300, 20);
         Controls.Add(lblStatus);
 
-        // Inicializar el temporizador con el mismo intervalo de tu script (50ms)
+        // Etiqueta del filtro
+        Label lblFiltro = new Label();
+        lblFiltro.Text = "Filtro (un elemento por línea):";
+        lblFiltro.Location = new Point(10, 32);
+        lblFiltro.Size = new Size(300, 18);
+        Controls.Add(lblFiltro);
+
+        // Cuadro de texto con la lista de comparación
+        txtFiltro = new TextBox();
+        txtFiltro.Multiline = true;
+        txtFiltro.AcceptsReturn = true;
+        txtFiltro.WordWrap = false;
+        txtFiltro.ScrollBars = ScrollBars.Both;
+        txtFiltro.Location = new Point(10, 52);
+        txtFiltro.Size = new Size(300, 190);
+        Controls.Add(txtFiltro);
+
+        // Zona de resultado (verde = coincide, rojo = no coincide; tonos discretos)
+        lblAlerta = new Label();
+        lblAlerta.Text = "";
+        lblAlerta.TextAlign = ContentAlignment.MiddleCenter;
+        lblAlerta.Location = new Point(10, 248);
+        lblAlerta.Size = new Size(300, 44);
+        Controls.Add(lblAlerta);
+
+        // Temporizador con el mismo intervalo de tu script (50ms)
         timer = new Timer();
         timer.Interval = 50;
         timer.Tick += Tick;
@@ -60,9 +94,16 @@ public class AutoForm : Form
 
     private void Tick(object sender, EventArgs e)
     {
+        // Si la ventana del filtro está activa (editando el filtro),
+        // NO disparamos la secuencia para no cortar/pegar por accidente.
+        if (GetForegroundWindow() == this.Handle)
+        {
+            return;
+        }
+
         // Detección de tecla usando GetAsyncKeyState (Mismo método de tu script de conteo)
         bool leftDown = (GetAsyncKeyState(VK_LEFT) & 0x8000) != 0;
-        
+
         if (leftDown && !leftEnEjecucion)
         {
             // Control de tiempo para evitar ejecuciones repetidas ráfaga (250ms)
@@ -70,13 +111,13 @@ public class AutoForm : Form
             {
                 leftEnEjecucion = true;
                 leftUltimoDisparo = DateTime.Now;
-                
+
                 EjecutarSecuenciaTeclas();
-                
+
                 leftEnEjecucion = false;
             }
         }
-        else if (!leftDown) 
+        else if (!leftDown)
         {
             leftEnEjecucion = false;
         }
@@ -90,9 +131,21 @@ public class AutoForm : Form
             SendKeys.SendWait("^a");
             System.Threading.Thread.Sleep(100);
 
-            // 2. CTRL + X (Cortar)
+            // 2. CTRL + X (Cortar) -> el contenido queda en el portapapeles
             SendKeys.SendWait("^x");
-            System.Threading.Thread.Sleep(100);
+            System.Threading.Thread.Sleep(120);
+
+            // 2b. COMPARAR lo copiado con el filtro (verde = coincide, rojo = no)
+            string contenido = LeerPortapapeles();
+            string coincidencia = BuscarCoincidencia(contenido);
+            if (coincidencia != null)
+            {
+                MostrarCoincide(coincidencia);
+            }
+            else
+            {
+                MostrarNoCoincide();
+            }
 
             // 3. ALT + TAB (Cambiar de ventana)
             SendKeys.SendWait("%{TAB}");
@@ -112,6 +165,63 @@ public class AutoForm : Form
         catch { }
     }
 
+    // Lee el portapapeles con un par de reintentos (a veces está bloqueado un instante)
+    private string LeerPortapapeles()
+    {
+        for (int intento = 0; intento < 3; intento++)
+        {
+            try
+            {
+                if (Clipboard.ContainsText())
+                {
+                    return Clipboard.GetText();
+                }
+                return "";
+            }
+            catch
+            {
+                System.Threading.Thread.Sleep(40);
+            }
+        }
+        return "";
+    }
+
+    // Devuelve el primer elemento del filtro que aparezca en el contenido copiado
+    // (comparación sin distinguir mayúsculas/minúsculas). null si no coincide nada.
+    private string BuscarCoincidencia(string contenido)
+    {
+        if (string.IsNullOrEmpty(contenido)) return null;
+
+        foreach (string linea in txtFiltro.Lines)
+        {
+            string term = linea.Trim();
+            if (term.Length == 0) continue;
+
+            if (contenido.IndexOf(term, StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                return term;
+            }
+        }
+        return null;
+    }
+
+    private void MostrarCoincide(string term)
+    {
+        // Coincide -> verde discreto (fondo pastel + texto verde oscuro)
+        lblAlerta.Text = "Coincide: " + term;
+        lblAlerta.BackColor = Color.FromArgb(224, 242, 224);
+        lblAlerta.ForeColor = Color.FromArgb(34, 110, 34);
+        try { SystemSounds.Asterisk.Play(); } catch { }
+    }
+
+    private void MostrarNoCoincide()
+    {
+        // No coincide -> rojo discreto (fondo pastel + texto rojo oscuro)
+        lblAlerta.Text = "Sin coincidencia";
+        lblAlerta.BackColor = Color.FromArgb(248, 224, 224);
+        lblAlerta.ForeColor = Color.FromArgb(150, 40, 40);
+    }
+
     [STAThread]
     public static void Main()
     {
@@ -119,8 +229,9 @@ public class AutoForm : Form
         Application.Run(new AutoForm());
     }
 
-    // Declaración nativa idéntica a tu script original
+    // Declaraciones nativas
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
 }
 "@
 
