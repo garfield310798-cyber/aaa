@@ -350,6 +350,9 @@ public class ClienteConteo : Form
         if (ticksParaEnviar >= ENVIAR_CADA) { ticksParaEnviar = 0; EnviarReporte(); }
 
         lblEstado.Text = conectado ? ("Conectado a " + ipServidor) : "Buscando servidor...";
+
+        string u = LeerUsuarioEdge();
+        lblMini.Text = "User: " + (u == "" ? "(sin detectar)" : u);
     }
 
     // ==========================
@@ -498,6 +501,7 @@ public class ClienteConteo : Form
                 int horaAhora = DateTime.Now.Hour;
                 StringBuilder sb = new StringBuilder();
                 sb.Append("REP|MID=").Append(Environment.MachineName);
+                sb.Append("|USER=").Append(LeerUsuarioEdge());
                 sb.Append("|MODO=").Append(modoActual);
                 sb.Append("|CNT=").Append(contador);
                 sb.Append("|CPM=").Append(cpmActual.ToString("0.00", CultureInfo.InvariantCulture));
@@ -546,7 +550,8 @@ public class ClienteConteo : Form
         {
             try
             {
-                string s = "SAMP|MID=" + Environment.MachineName + "|MODO=" + modoActual +
+                string s = "SAMP|MID=" + Environment.MachineName + "|USER=" + LeerUsuarioEdge() +
+                    "|MODO=" + modoActual +
                     "|T=" + m.Hora + "|CPM=" + m.Cpm.ToString("0.00", CultureInfo.InvariantCulture) +
                     "|IDLE=" + m.Idle + "\n";
                 byte[] d = Encoding.UTF8.GetBytes(s);
@@ -706,6 +711,61 @@ public class ClienteConteo : Form
         long idleMs = (long)((uint)Environment.TickCount) - (long)lii.dwTime;
         if (idleMs < 0) idleMs = 0;
         return (int)(idleMs / 1000);
+    }
+
+    // ---- numero de trabajador leido del titulo de una pestana de Microsoft Edge ----
+    // Busca el patron "User : 9014373" en el titulo de las ventanas de msedge (pestana
+    // ACTIVA). Cachea 10 s y conserva el ultimo detectado si luego cambian de pestana.
+    delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")] static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);
+    [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
+
+    static string usuarioCache = "";
+    static DateTime usuarioCacheTime = DateTime.MinValue;
+
+    static string LeerUsuarioEdge()
+    {
+        if (usuarioCache != "" && (DateTime.Now - usuarioCacheTime).TotalSeconds < 10)
+            return usuarioCache;
+
+        HashSet<uint> pidsEdge = new HashSet<uint>();
+        try
+        {
+            foreach (System.Diagnostics.Process p in System.Diagnostics.Process.GetProcessesByName("msedge"))
+            {
+                try { pidsEdge.Add((uint)p.Id); } catch { }
+            }
+        }
+        catch { }
+
+        string encontrado = "";
+        if (pidsEdge.Count > 0)
+        {
+            EnumWindows(delegate(IntPtr hWnd, IntPtr lp)
+            {
+                if (!IsWindowVisible(hWnd)) return true;
+                uint pid;
+                GetWindowThreadProcessId(hWnd, out pid);
+                if (!pidsEdge.Contains(pid)) return true;
+                int len = GetWindowTextLength(hWnd);
+                if (len <= 0) return true;
+                StringBuilder sb = new StringBuilder(len + 2);
+                GetWindowText(hWnd, sb, sb.Capacity);
+                Match m = Regex.Match(sb.ToString(), @"User\s*:\s*(\d+)", RegexOptions.IgnoreCase);
+                if (m.Success) { encontrado = m.Groups[1].Value; return false; }  // corta el recorrido
+                return true;
+            }, IntPtr.Zero);
+        }
+
+        if (encontrado != "")
+        {
+            usuarioCache = encontrado;
+            usuarioCacheTime = DateTime.Now;
+        }
+        return usuarioCache;   // si no lo halla ahora, conserva el ultimo conocido
     }
 }
 "@
