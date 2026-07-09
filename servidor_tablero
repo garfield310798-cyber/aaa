@@ -1,0 +1,2110 @@
+# ================================
+# SERVIDOR - TABLERO DE PRODUCCION
+# - Corre en cualquier IP. Invita por UDP (broadcast) para que los clientes se conecten (TCP).
+# - El registro se lleva POR USUARIO (numero leido de Edge, campo USER), sin importar la IP,
+#   la maquina, ni el area (Retail/ECOM). Si un mismo usuario reporta desde varias maquinas,
+#   su historial por hora se SUMA (una fila por persona).
+# - Resuelve el nombre del trabajador desde bd.md (numero/codigo -> nombre).
+# - Exporta el registro del dia (tablero_YYYY-MM-DD.csv) con el desglose por hora.
+# PowerShell 5.1 compatible
+# ================================
+
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class Win32Console {
+    [DllImport("kernel32.dll")]
+    public static extern IntPtr GetConsoleWindow();
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+}
+"@
+$h = [Win32Console]::GetConsoleWindow()
+if ($h -ne [IntPtr]::Zero) { [Win32Console]::ShowWindow($h, 0) }
+
+$base = $PSScriptRoot
+if ([string]::IsNullOrEmpty($base)) { $base = (Get-Location).Path }
+
+Add-Type -ReferencedAssemblies @(
+    "System.Windows.Forms",
+    "System.Drawing"
+) -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
+using System.Drawing;
+
+// Una fuente = una maquina/sesion que reporta para un usuario.
+public class Fuente
+{
+    public string MID = "";
+    public string IP = "";
+    public string Modo = "Retail";
+    public int Cnt;
+    public double Cpm;
+    public int Est;
+    public int Hora;
+    public int HIni = 6;
+    public int[] Hist = new int[0];
+    public double[] HistCpm = new double[0];
+    public int[] HistEst = new int[0];
+    public int Idle;
+    public bool Pres = true;
+    public DateTime LastSeen = DateTime.Now;
+}
+
+// Registro agregado POR USUARIO (o por maquina si aun no se detecto el USER).
+public class Registro
+{
+    public string Clave = "";  // "U:<user>" | "M:<mid>" | "IP:<ip>"
+    public string User = "";
+    public Dictionary<string, Fuente> Fuentes = new Dictionary<string, Fuente>(); // MID -> fuente
+    public SortedDictionary<string, double> MCpm = new SortedDictionary<string, double>(); // HH:mm -> CPM
+    public SortedDictionary<string, int> MIdle = new SortedDictionary<string, int>();       // HH:mm -> inactividad
+
+    public Fuente Activa()
+    {
+        Fuente best = null;
+        foreach (Fuente f in Fuentes.Values)
+            if (best == null || f.LastSeen > best.LastSeen) best = f;
+        return best;
+    }
+
+    public DateTime UltimoLatido()
+    {
+        DateTime dt = DateTime.MinValue;
+        foreach (Fuente f in Fuentes.Values) if (f.LastSeen > dt) dt = f.LastSeen;
+        return dt;
+    }
+
+    // Combina (suma por hora absoluta) el historial de todas las maquinas del usuario.
+    public void Combinar(out int hIni, out int[] cnt, out double[] cpm, out int[] est)
+    {
+        int minH = int.MaxValue, maxH = int.MinValue;
+        foreach (Fuente f in Fuentes.Values)
+        {
+            if (f.Hist.Length == 0) continue;
+            if (f.HIni < minH) minH = f.HIni;
+            int last = f.HIni + f.Hist.Length - 1;
+            if (last > maxH) maxH = last;
+        }
+        if (minH == int.MaxValue) { hIni = 6; cnt = new int[0]; cpm = new double[0]; est = new int[0]; return; }
+        int len = maxH - minH + 1;
+        int[] c = new int[len]; double[] p = new double[len]; int[] e = new int[len];
+        foreach (Fuente f in Fuentes.Values)
+        {
+            int off = f.HIni - minH;
+            for (int i = 0; i < f.Hist.Length; i++)
+            {
+                int idx = off + i;
+                if (idx < 0 || idx >= len) continue;
+                c[idx] += f.Hist[i];
+                if (i < f.HistCpm.Length && f.HistCpm[i] > p[idx]) p[idx] = f.HistCpm[i]; // CPM: el mayor de la hora
+                if (i < f.HistEst.Length) e[idx] += f.HistEst[i];
+            }
+        }
+        hIni = minH; cnt = c; cpm = p; est = e;
+    }
+
+    public int TotalDia()
+    {
+        int hIni; int[] c; double[] p; int[] e;
+        Combinar(out hIni, out c, out p, out e);
+        int t = 0; foreach (int v in c) t += v; return t;
+    }
+}
+
+public class ServidorTablero : Form
+{
+    TcpListener listener;
+    UdpClient udp;
+    int puertoTcp = 9600;
+    int puertoUdp = 9500;
+    const int CONECTADO_SEG = 10; // sin senal por mas de esto = desconectado (rojo)
+
+    object lockDatos = new object();
+    object lockArchivo = new object();
+    Dictionary<string, Registro> registros = new Dictionary<string, Registro>(); // clave -> registro
+    Dictionary<string, string> nombres = new Dictionary<string, string>();        // identidad -> nombre manual
+    Dictionary<string, string> usuariosDb = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); // USER -> nombre (bd.md)
+    Dictionary<string, string> claveDeIp = new Dictionary<string, string>();       // ip -> clave (para SAMP sin USER)
+    Dictionary<string, bool> muestrasVistas = new Dictionary<string, bool>();      // dedupe identidad|hora
+
+    TextBox txtPuertoUdp, txtPuertoTcp, txtIPs, txtNombre;
+    CheckBox chkBroadcast;
+    Button btnInvitar, btnAsignar, btnExportar;
+    Label lblEstado, lblTot, lblHeader;
+    ComboBox cboIP, cboArea, cboEstado;
+    DataGridView grid;
+
+    string areaMostrar = "Todos";
+    string estadoMostrar = "Con trabajador";
+
+    Timer timerUI, timerLog;
+
+    public static string CarpetaBase = ".";
+    public static string UsuariosTexto = ""; // base de datos embebida (id -> nombre), opcional
+    string ArchNombres { get { return Path.Combine(CarpetaBase, "nombres.csv"); } }
+    string ArchUsuarios { get { return Path.Combine(CarpetaBase, "bd.md"); } }
+    string ArchLog { get { return Path.Combine(CarpetaBase, "tablero_" + DateTime.Now.ToString("yyyy-MM-dd") + ".csv"); } }
+    string ArchMuestras { get { return Path.Combine(CarpetaBase, "muestras2min_" + DateTime.Now.ToString("yyyy-MM-dd") + ".csv"); } }
+
+    public ServidorTablero()
+    {
+        Text = "Tablero de Produccion (por usuario)";
+        Width = 760; Height = 680;
+        StartPosition = FormStartPosition.CenterScreen;
+        TopMost = true;             // siempre visible, por encima de las demas ventanas
+        MinimumSize = new Size(620, 480);
+        Font = new Font("Segoe UI", 9F);
+        BackColor = Color.White;
+
+        // ---- barra superior ----
+        Panel top = new Panel();
+        top.Dock = DockStyle.Top;
+        top.Height = 132;
+        top.BackColor = Color.White;
+
+        // fila A
+        top.Controls.Add(Etq("Mostrar:", 8, 11));
+        cboArea = new ComboBox();
+        cboArea.DropDownStyle = ComboBoxStyle.DropDownList;
+        cboArea.Items.AddRange(new string[] { "Todos", "Retail", "ECOM" });
+        cboArea.SelectedIndex = 0;
+        cboArea.Location = new Point(62, 8); cboArea.Width = 90;
+        cboArea.SelectedIndexChanged += delegate { CambiarArea(); };
+        top.Controls.Add(cboArea);
+
+        top.Controls.Add(Etq("Estado:", 162, 11));
+        cboEstado = new ComboBox();
+        cboEstado.DropDownStyle = ComboBoxStyle.DropDownList;
+        cboEstado.Items.AddRange(new string[] { "Con trabajador", "Trabajando", "Inactivos", "Sin trabajador", "Desconectados", "Todos" });
+        cboEstado.SelectedIndex = 0;
+        cboEstado.Location = new Point(212, 8); cboEstado.Width = 130;
+        cboEstado.SelectedIndexChanged += delegate { estadoMostrar = cboEstado.Text; RefrescarUI(); };
+        top.Controls.Add(cboEstado);
+
+        chkBroadcast = new CheckBox();
+        chkBroadcast.Text = "Broadcast";
+        chkBroadcast.Checked = true;
+        chkBroadcast.BackColor = Color.Transparent;
+        chkBroadcast.Location = new Point(352, 9); chkBroadcast.Width = 88;
+        top.Controls.Add(chkBroadcast);
+
+        top.Controls.Add(Etq("UDP", 448, 11));
+        txtPuertoUdp = Txt(puertoUdp.ToString(), 480, 8, 45); top.Controls.Add(txtPuertoUdp);
+        top.Controls.Add(Etq("TCP", 533, 11));
+        txtPuertoTcp = Txt(puertoTcp.ToString(), 565, 8, 45); top.Controls.Add(txtPuertoTcp);
+
+        // fila B
+        btnInvitar = Boton("Conectar", 8, 38, 120);
+        btnInvitar.Click += delegate { Invitar(); };
+        top.Controls.Add(btnInvitar);
+
+        btnExportar = Boton("Exportar CSV", 134, 38, 120);
+        btnExportar.Click += delegate { GuardarLog(true); };
+        top.Controls.Add(btnExportar);
+
+        top.Controls.Add(Etq("IPs manuales:", 268, 41));
+        txtIPs = new TextBox();
+        txtIPs.Multiline = true; txtIPs.ScrollBars = ScrollBars.Vertical;
+        txtIPs.Location = new Point(355, 39); txtIPs.Width = 190; txtIPs.Height = 24;
+        top.Controls.Add(txtIPs);
+
+        // fila C
+        top.Controls.Add(Etq("Nombre a USER:", 8, 72));
+        cboIP = new ComboBox();
+        cboIP.DropDownStyle = ComboBoxStyle.DropDownList;
+        cboIP.Location = new Point(108, 69); cboIP.Width = 134;
+        cboIP.SelectedIndexChanged += delegate { MostrarNombreDeSeleccion(); };
+        top.Controls.Add(cboIP);
+
+        txtNombre = Txt("", 250, 70, 150); top.Controls.Add(txtNombre);
+        btnAsignar = Boton("Guardar", 406, 68, 90);
+        btnAsignar.Click += delegate { AsignarNombre(); };
+        top.Controls.Add(btnAsignar);
+
+        // fila D
+        lblEstado = Etq("Iniciando...", 8, 100);
+        lblEstado.AutoSize = false; lblEstado.Width = 740; lblEstado.Height = 28;
+        lblEstado.ForeColor = Color.Gray;
+        top.Controls.Add(lblEstado);
+
+        // ---- cabecera de area ----
+        lblHeader = new Label();
+        lblHeader.Dock = DockStyle.Top;
+        lblHeader.Height = 34;
+        lblHeader.TextAlign = ContentAlignment.MiddleCenter;
+        lblHeader.Font = new Font("Segoe UI", 14);
+        lblHeader.ForeColor = Color.DimGray;
+        lblHeader.Text = "TODOS";
+
+        // ---- total (metricas globales) ----
+        lblTot = new Label();
+        lblTot.Dock = DockStyle.Bottom;
+        lblTot.Height = 50;
+        lblTot.TextAlign = ContentAlignment.MiddleCenter;
+        lblTot.Font = new Font("Segoe UI", 10);
+        lblTot.ForeColor = Color.DimGray;
+        lblTot.Text = "Mostrando: 0     Trabajando: 0     Total dia: 0     Escaneando (hora): 0";
+
+        // ---- grid ----
+        grid = new DataGridView();
+        grid.Dock = DockStyle.Fill;
+        grid.ReadOnly = true;
+        grid.AllowUserToAddRows = false;
+        grid.AllowUserToDeleteRows = false;
+        grid.AllowUserToResizeRows = false;
+        grid.RowHeadersVisible = false;
+        grid.MultiSelect = false;
+        grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
+        grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+
+        // ---- aspecto minimo: solo blanco y gris ----
+        grid.BackgroundColor = Color.White;
+        grid.BorderStyle = BorderStyle.None;
+        grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+        grid.GridColor = Color.Gainsboro;
+        grid.EnableHeadersVisualStyles = false;
+        grid.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single;
+        grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.DisableResizing;
+        grid.ColumnHeadersHeight = 34;
+        grid.ColumnHeadersDefaultCellStyle.Font = new Font("Segoe UI", 10);
+        grid.ColumnHeadersDefaultCellStyle.BackColor = Color.White;
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.DimGray;
+        grid.DefaultCellStyle.Font = new Font("Segoe UI", 12);
+        grid.DefaultCellStyle.ForeColor = Color.FromArgb(40, 40, 40);
+        grid.DefaultCellStyle.SelectionBackColor = Color.Gainsboro;
+        grid.DefaultCellStyle.SelectionForeColor = Color.Black;
+        grid.AlternatingRowsDefaultCellStyle.BackColor = Color.FromArgb(248, 248, 248);
+        grid.RowTemplate.Height = 34;
+
+        grid.Columns.Add("Nombre", "Trabajador");
+        grid.Columns.Add("User", "User");
+        grid.Columns.Add("Area", "Area");
+        grid.Columns.Add("Estado", "Estado");
+        grid.Columns.Add("Cnt", "Escaneando");
+        grid.Columns.Add("Cpm", "CPM (5m)");
+        grid.Columns.Add("Est", "Estimado");
+        grid.Columns.Add("Total", "Total dia");
+        grid.Columns.Add("Pres", "Presencia");
+        grid.Columns.Add("Ult", "Ult. senal");
+        grid.Columns["Nombre"].FillWeight = 150;
+        grid.Columns["User"].FillWeight = 80;
+        grid.Columns["Area"].FillWeight = 65;
+        grid.Columns["Estado"].FillWeight = 85;
+        string[] centrar = new string[] { "User", "Area", "Estado", "Cnt", "Cpm", "Est", "Total", "Pres", "Ult" };
+        foreach (string c in centrar) grid.Columns[c].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+
+        // doble clic en una fila -> desglose por hora de ese trabajador
+        grid.CellDoubleClick += delegate(object s, DataGridViewCellEventArgs ev)
+        {
+            if (ev.RowIndex < 0 || ev.RowIndex >= grid.Rows.Count) return;
+            string clave = grid.Rows[ev.RowIndex].Tag as string;
+            if (!string.IsNullOrEmpty(clave)) MostrarDetalle(clave);
+        };
+
+        Panel divisor = new Panel();
+        divisor.Dock = DockStyle.Top;
+        divisor.Height = 1;
+        divisor.BackColor = Color.Gainsboro;
+
+        Controls.Add(grid);
+        Controls.Add(lblTot);
+        Controls.Add(lblHeader);
+        Controls.Add(divisor);
+        Controls.Add(top);
+
+        CargarUsuarios();
+        CargarNombres();
+        CargarMuestrasVistas();
+        IniciarServidor();
+
+        timerUI = new Timer(); timerUI.Interval = 1000; timerUI.Tick += delegate { RefrescarUI(); }; timerUI.Start();
+        timerLog = new Timer(); timerLog.Interval = 60000; timerLog.Tick += delegate { GuardarLog(false); }; timerLog.Start();
+    }
+
+    // ==========================
+    // Helpers UI
+    // ==========================
+    Label Etq(string t, int x, int y)
+    {
+        Label l = new Label(); l.Text = t; l.AutoSize = true; l.Location = new Point(x, y);
+        return l;
+    }
+    TextBox Txt(string t, int x, int y, int w)
+    {
+        TextBox b = new TextBox(); b.Text = t; b.Location = new Point(x, y); b.Width = w; return b;
+    }
+    Button Boton(string t, int x, int y, int w)
+    {
+        Button b = new Button(); b.Text = t; b.Location = new Point(x, y); b.Width = w; return b;
+    }
+
+    void CambiarArea()
+    {
+        areaMostrar = cboArea.Text;
+        lblHeader.Text = areaMostrar.ToUpper();
+        RefrescarUI();
+    }
+
+    static string Clave(string user, string mid, string ip)
+    {
+        if (!string.IsNullOrEmpty(user)) return "U:" + user;
+        if (!string.IsNullOrEmpty(mid)) return "M:" + mid;
+        return "IP:" + ip;
+    }
+
+    // identidad para nombres manuales / dedupe (numero de usuario o, si no hay, la maquina)
+    static string Identidad(Registro r)
+    {
+        if (!string.IsNullOrEmpty(r.User)) return r.User;
+        Fuente a = r.Activa();
+        if (a != null && !string.IsNullOrEmpty(a.MID)) return a.MID;
+        return r.Clave;
+    }
+
+    // ==========================
+    // Servidor TCP
+    // ==========================
+    void IniciarServidor()
+    {
+        try
+        {
+            int.TryParse(txtPuertoTcp.Text.Trim(), out puertoTcp);
+            listener = new TcpListener(IPAddress.Any, puertoTcp);
+            listener.Start();
+            listener.BeginAcceptTcpClient(OnClienteConectado, null);
+            lblEstado.Text = "Escuchando TCP " + puertoTcp + "  |  IP: " + IPsLocales();
+        }
+        catch (Exception ex) { lblEstado.Text = "Error servidor: " + ex.Message; }
+    }
+
+    string IPsLocales()
+    {
+        try
+        {
+            string r = "";
+            foreach (IPAddress a in Dns.GetHostAddresses(Dns.GetHostName()))
+                if (a.AddressFamily == AddressFamily.InterNetwork) r += a.ToString() + "  ";
+            return r.Trim();
+        }
+        catch { return ""; }
+    }
+
+    void OnClienteConectado(IAsyncResult ar)
+    {
+        TcpClient cli;
+        try { cli = listener.EndAcceptTcpClient(ar); }
+        catch { return; }
+        finally { try { listener.BeginAcceptTcpClient(OnClienteConectado, null); } catch { } }
+
+        string ip = ((IPEndPoint)cli.Client.RemoteEndPoint).Address.ToString();
+        byte[] buffer = new byte[8192];
+        object[] estado = new object[] { cli, buffer, ip, new StringBuilder() };
+        try { cli.GetStream().BeginRead(buffer, 0, buffer.Length, OnDatos, estado); } catch { }
+    }
+
+    void OnDatos(IAsyncResult ar)
+    {
+        object[] estado = (object[])ar.AsyncState;
+        TcpClient cli = (TcpClient)estado[0];
+        byte[] buffer = (byte[])estado[1];
+        string ip = (string)estado[2];
+        StringBuilder acum = (StringBuilder)estado[3];
+
+        int n;
+        try { n = cli.GetStream().EndRead(ar); } catch { n = 0; }
+        if (n <= 0) { try { cli.Close(); } catch { } return; }
+
+        acum.Append(Encoding.UTF8.GetString(buffer, 0, n));
+        string todo = acum.ToString();
+        int idx;
+        while ((idx = todo.IndexOf('\n')) >= 0)
+        {
+            string linea = todo.Substring(0, idx).Trim();
+            todo = todo.Substring(idx + 1);
+            if (linea.Length > 0) ProcesarLinea(ip, linea);
+        }
+        acum.Length = 0; acum.Append(todo);
+
+        try { cli.GetStream().BeginRead(buffer, 0, buffer.Length, OnDatos, estado); }
+        catch { try { cli.Close(); } catch { } }
+    }
+
+    void ProcesarLinea(string ip, string linea)
+    {
+        if (linea.StartsWith("SAMP")) { ProcesarSample(ip, linea); return; }
+        if (!linea.StartsWith("REP")) return;
+
+        // 1) parsear a variables temporales
+        string user = "", mid = "", modo = "Retail";
+        int cnt = 0, est = 0, hora = 0, hini = 6, idle = 0; double cpm = 0; bool pres = true;
+        int[] hist = new int[0]; double[] hcpm = new double[0]; int[] hest = new int[0];
+
+        string[] partes = linea.Split('|');
+        foreach (string parte in partes)
+        {
+            int eq = parte.IndexOf('=');
+            if (eq <= 0) continue;
+            string k = parte.Substring(0, eq);
+            string v = parte.Substring(eq + 1);
+            switch (k)
+            {
+                case "USER": user = v.Trim(); break;
+                case "MID": mid = v; break;
+                case "MODO": modo = v; break;
+                case "CNT": int.TryParse(v, out cnt); break;
+                case "CPM": double.TryParse(v, NumberStyles.Any, CultureInfo.InvariantCulture, out cpm); break;
+                case "EST": int.TryParse(v, out est); break;
+                case "HR": int.TryParse(v, out hora); break;
+                case "HINI": int.TryParse(v, out hini); break;
+                case "HIST": hist = ParseInts(v); break;
+                case "HCPM": hcpm = ParseDoubles(v); break;
+                case "HEST": hest = ParseInts(v); break;
+                case "IDLE": int.TryParse(v, out idle); break;
+                case "PRES": pres = (v == "1"); break;
+            }
+        }
+
+        // 2) guardar bajo la clave del usuario
+        string clave = Clave(user, mid, ip);
+        string fkey = (mid.Length > 0) ? mid : ip;
+        lock (lockDatos)
+        {
+            Registro r;
+            if (!registros.TryGetValue(clave, out r)) { r = new Registro(); r.Clave = clave; registros[clave] = r; }
+            if (user.Length > 0) r.User = user;
+
+            Fuente f;
+            if (!r.Fuentes.TryGetValue(fkey, out f)) { f = new Fuente(); r.Fuentes[fkey] = f; }
+            f.MID = mid; f.IP = ip; f.Modo = modo;
+            f.Cnt = cnt; f.Cpm = cpm; f.Est = est; f.Hora = hora; f.HIni = hini;
+            f.Hist = hist; f.HistCpm = hcpm; f.HistEst = hest;
+            f.Idle = idle; f.Pres = pres; f.LastSeen = DateTime.Now;
+
+            claveDeIp[ip] = clave;
+
+            // si ya conocemos el USER, absorber el registro anonimo de esa maquina (si existia)
+            if (user.Length > 0 && mid.Length > 0)
+            {
+                string anon = "M:" + mid;
+                Registro ra;
+                if (anon != clave && registros.TryGetValue(anon, out ra))
+                {
+                    foreach (KeyValuePair<string, double> kv in ra.MCpm) r.MCpm[kv.Key] = kv.Value;
+                    foreach (KeyValuePair<string, int> kv in ra.MIdle) r.MIdle[kv.Key] = kv.Value;
+                    registros.Remove(anon);
+                }
+            }
+        }
+    }
+
+    int[] ParseInts(string v)
+    {
+        string[] hs = v.Split(',');
+        int[] arr = new int[hs.Length];
+        for (int i = 0; i < hs.Length; i++) { int x; int.TryParse(hs[i], out x); arr[i] = x; }
+        return arr;
+    }
+    double[] ParseDoubles(string v)
+    {
+        string[] cs = v.Split(',');
+        double[] arr = new double[cs.Length];
+        for (int i = 0; i < cs.Length; i++) { double x; double.TryParse(cs[i], NumberStyles.Any, CultureInfo.InvariantCulture, out x); arr[i] = x; }
+        return arr;
+    }
+
+    // ==========================
+    // Muestras cada 2 min (CPM e inactividad) -> agregadas por usuario
+    // ==========================
+    void ProcesarSample(string ip, string linea)
+    {
+        string user = "", mid = "", modo = "", t = "", cpm = "0", idle = "0";
+        string[] partes = linea.Split('|');
+        foreach (string parte in partes)
+        {
+            int eq = parte.IndexOf('=');
+            if (eq <= 0) continue;
+            string k = parte.Substring(0, eq);
+            string v = parte.Substring(eq + 1);
+            switch (k)
+            {
+                case "USER": user = v.Trim(); break;
+                case "MID": mid = v; break;
+                case "MODO": modo = v; break;
+                case "T": t = v; break;
+                case "CPM": cpm = v; break;
+                case "IDLE": idle = v; break;
+            }
+        }
+        if (t.Length == 0) return;
+
+        string identidad, nombre, area = modo;
+        lock (lockDatos)
+        {
+            // clave: por USER si viene; si no, seguir la clave que uso el REP de esta IP
+            string clave;
+            if (user.Length > 0) clave = Clave(user, mid, ip);
+            else if (!claveDeIp.TryGetValue(ip, out clave)) clave = Clave("", mid, ip);
+
+            Registro r;
+            if (!registros.TryGetValue(clave, out r)) { r = new Registro(); r.Clave = clave; registros[clave] = r; }
+            if (user.Length > 0) r.User = user;
+
+            double cp; double.TryParse(cpm, NumberStyles.Any, CultureInfo.InvariantCulture, out cp);
+            int id; int.TryParse(idle, out id);
+            r.MCpm[t] = cp;
+            r.MIdle[t] = id;
+
+            if (modo.Length > 0)
+            {
+                string fkey = (mid.Length > 0) ? mid : ip;
+                Fuente f;
+                if (r.Fuentes.TryGetValue(fkey, out f)) f.Modo = modo;
+            }
+            if (area.Length == 0) { Fuente a = r.Activa(); if (a != null) area = a.Modo; }
+
+            identidad = Identidad(r);
+            nombre = NombreDeSinLock(r);
+        }
+        GuardarMuestra(identidad, nombre, area, ip, t, cpm, idle);
+    }
+
+    void GuardarMuestra(string identidad, string nombre, string area, string ip, string hora, string cpm, string idle)
+    {
+        string key = identidad + "|" + hora;
+        lock (lockArchivo)
+        {
+            if (muestrasVistas.ContainsKey(key)) return;
+            try
+            {
+                Directory.CreateDirectory(CarpetaBase);
+                bool existe = File.Exists(ArchMuestras);
+                using (StreamWriter w = new StreamWriter(ArchMuestras, true))
+                {
+                    if (!existe) w.WriteLine("Fecha,Hora,User,Nombre,Area,IP,CPM,InactivoSeg");
+                    w.WriteLine(DateTime.Now.ToString("yyyy-MM-dd") + "," + hora + "," + identidad + "," +
+                        nombre.Replace(",", " ") + "," + area + "," + ip + "," + cpm + "," + idle);
+                }
+                muestrasVistas[key] = true; // marcar solo si se escribio bien
+            }
+            catch { }
+        }
+    }
+
+    void CargarMuestrasVistas()
+    {
+        try
+        {
+            if (!File.Exists(ArchMuestras)) return;
+            string[] ls = File.ReadAllLines(ArchMuestras);
+            for (int i = 1; i < ls.Length; i++)
+            {
+                string[] p = ls[i].Split(',');
+                if (p.Length < 3) continue;
+                muestrasVistas[p[2] + "|" + p[1]] = true; // identidad|hora
+            }
+        }
+        catch { }
+    }
+
+    // ==========================
+    // UDP invitacion
+    // ==========================
+    void Invitar()
+    {
+        try
+        {
+            int.TryParse(txtPuertoUdp.Text.Trim(), out puertoUdp);
+            int.TryParse(txtPuertoTcp.Text.Trim(), out puertoTcp);
+            byte[] datos = Encoding.UTF8.GetBytes("CONNECT:" + puertoTcp);
+
+            if (udp == null) { udp = new UdpClient(); udp.EnableBroadcast = true; }
+
+            // envio a demanda: 3 repeticiones por si se pierde algun datagrama UDP
+            for (int rep = 0; rep < 3; rep++)
+            {
+                if (chkBroadcast.Checked)
+                    try { udp.Send(datos, datos.Length, new IPEndPoint(IPAddress.Broadcast, puertoUdp)); } catch { }
+
+                string[] lineas = txtIPs.Text.Replace("\r", "").Split('\n');
+                foreach (string ln in lineas)
+                {
+                    string ip = ln.Trim();
+                    if (ip.Length == 0) continue;
+                    try { udp.Send(datos, datos.Length, ip, puertoUdp); } catch { }
+                }
+            }
+            lblEstado.Text = "Invitacion enviada. Esperando que los clientes se conecten...";
+        }
+        catch { }
+    }
+
+    // ==========================
+    // Refresco del tablero
+    // ==========================
+    // Fila calculada (una por registro/usuario) lista para filtrar, ordenar y agregar.
+    class Vista
+    {
+        public Registro R; public Fuente A;
+        public int TotalDia, Escaneando, Est, IdleSeg;
+        public double Cpm, Seg;
+        public bool Conectado, Presente, HayTrab, Trabajando;
+        public string Estado;
+    }
+
+    static Color ColorEstado(string e)
+    {
+        if (e == "Trabajando") return Color.FromArgb(30, 160, 30);   // verde
+        if (e == "Inactivo") return Color.FromArgb(210, 140, 0);     // ambar
+        if (e == "Vacia") return Color.FromArgb(150, 150, 150);      // gris
+        return Color.FromArgb(200, 40, 40);                          // rojo (desconectado)
+    }
+
+    void RefrescarUI()
+    {
+        List<Registro> lista;
+        lock (lockDatos) { lista = new List<Registro>(registros.Values); }
+
+        ActualizarComboId(lista);
+
+        DateTime ahora = DateTime.Now;
+
+        // 1) calcular estado y metricas de cada registro
+        List<Vista> vistas = new List<Vista>();
+        foreach (Registro r in lista)
+        {
+            Fuente a = r.Activa();
+            if (a == null) continue;
+
+            int hIni; int[] hc; double[] hcpm; int[] hest;
+            r.Combinar(out hIni, out hc, out hcpm, out hest);
+            int totalDia = 0; foreach (int v in hc) totalDia += v;
+            int nowIdx = ahora.Hour - hIni;
+            int esc = (nowIdx >= 0 && nowIdx < hc.Length) ? hc[nowIdx] : 0;
+            int activaTotal = 0; foreach (int v in a.Hist) activaTotal += v;
+
+            Vista v2 = new Vista();
+            v2.R = r; v2.A = a;
+            v2.TotalDia = totalDia;
+            v2.Escaneando = esc;
+            v2.Cpm = a.Cpm;
+            v2.Est = totalDia - activaTotal + a.Est;
+            v2.Seg = (ahora - r.UltimoLatido()).TotalSeconds;
+            v2.Conectado = v2.Seg <= CONECTADO_SEG;
+            v2.Presente = a.Pres;
+            v2.IdleSeg = a.Idle;
+            // hay trabajador si hay un USER logueado en Edge, o si hubo/hay actividad
+            v2.HayTrab = (r.User.Length > 0) || totalDia > 0 || a.Cpm > 0;
+            // trabajando = conectado, presente y produciendo ahora
+            v2.Trabajando = v2.Conectado && a.Pres && (a.Cpm > 0 || esc > 0);
+            if (!v2.Conectado) v2.Estado = "Desconectado";
+            else if (v2.Trabajando) v2.Estado = "Trabajando";
+            else if (v2.HayTrab) v2.Estado = "Inactivo";
+            else v2.Estado = "Vacia";
+            vistas.Add(v2);
+        }
+
+        // 2) filas de la grilla = filtro por area + filtro por estado
+        List<Vista> fil = new List<Vista>();
+        foreach (Vista v in vistas)
+        {
+            bool areaOk = (areaMostrar == "Todos" || string.Equals(v.A.Modo, areaMostrar, StringComparison.OrdinalIgnoreCase));
+            if (areaOk && PasaEstado(v)) fil.Add(v);
+        }
+        fil.Sort(delegate(Vista a, Vista b) { return b.TotalDia.CompareTo(a.TotalDia); });
+
+        // 3) render de la grilla
+        grid.SuspendLayout();
+        grid.Rows.Clear();
+        foreach (Vista v in fil)
+        {
+            string presencia = (v.Presente ? "Si" : "No") + " (" + FmtIdle(v.IdleSeg) + ")";
+            string senal = ((char)0x25CF).ToString() + "  " + ((int)v.Seg) + "s";
+            int fila = grid.Rows.Add(NombreDe(v.R), v.R.User, v.A.Modo, v.Estado, v.Escaneando.ToString(),
+                v.Cpm.ToString("0.0"), v.Est.ToString(), v.TotalDia.ToString(), presencia, senal);
+            grid.Rows[fila].Tag = v.R.Clave;
+            Color dot = v.Conectado ? Color.FromArgb(30, 160, 30) : Color.FromArgb(200, 40, 40);
+            grid.Rows[fila].Cells["Ult"].Style.ForeColor = dot;
+            grid.Rows[fila].Cells["Ult"].Style.SelectionForeColor = dot;
+            Color ce = ColorEstado(v.Estado);
+            grid.Rows[fila].Cells["Estado"].Style.ForeColor = ce;
+            grid.Rows[fila].Cells["Estado"].Style.SelectionForeColor = ce;
+        }
+        grid.ResumeLayout();
+
+        // 4) metricas globales DIVIDIDAS POR AREA (respetan el filtro de estado, no el de area)
+        AreaAcc retail = new AreaAcc();
+        AreaAcc ecom = new AreaAcc();
+        foreach (Vista v in vistas)
+        {
+            if (!PasaEstado(v)) continue;
+            if (string.Equals(v.A.Modo, "Retail", StringComparison.OrdinalIgnoreCase)) retail.Add(v);
+            else if (string.Equals(v.A.Modo, "ECOM", StringComparison.OrdinalIgnoreCase)) ecom.Add(v);
+        }
+        lblTot.Text = retail.Linea("RETAIL") + "\n" + ecom.Linea("ECOM ");
+    }
+
+    bool PasaEstado(Vista v)
+    {
+        switch (estadoMostrar)
+        {
+            case "Trabajando":      return v.Trabajando;
+            case "Inactivos":       return v.Estado == "Inactivo";
+            case "Sin trabajador":  return v.Estado == "Vacia";
+            case "Desconectados":   return !v.Conectado;
+            case "Con trabajador":  return v.HayTrab;
+            default:                return true; // Todos
+        }
+    }
+
+    // Acumulador de metricas de un area para la barra inferior.
+    class AreaAcc
+    {
+        public int Pers, Trab, Total, Esc, Est, Act;
+        public double CpmSum;
+        public void Add(Vista v)
+        {
+            Pers++;
+            if (v.Trabajando) Trab++;
+            Total += v.TotalDia; Esc += v.Escaneando; Est += v.Est;
+            if (v.Cpm > 0) { CpmSum += v.Cpm; Act++; }
+        }
+        public string Linea(string nombre)
+        {
+            double prom = Act > 0 ? CpmSum / Act : 0;
+            return nombre + "   Trab " + Trab + "/" + Pers + "   Total " + Total +
+                "   Escan " + Esc + "   CPMprom " + prom.ToString("0.0") +
+                "   CPMtot " + CpmSum.ToString("0.0") + "   Est " + Est;
+        }
+    }
+
+    void ActualizarComboId(List<Registro> lista)
+    {
+        List<string> actuales = new List<string>();
+        foreach (Registro r in lista) { string id = Identidad(r); if (!actuales.Contains(id)) actuales.Add(id); }
+        actuales.Sort();
+
+        bool igual = (cboIP.Items.Count == actuales.Count);
+        if (igual)
+            foreach (object o in cboIP.Items) if (!actuales.Contains((string)o)) { igual = false; break; }
+
+        if (!igual)
+        {
+            string sel = cboIP.SelectedItem as string;
+            cboIP.Items.Clear();
+            foreach (string id in actuales) cboIP.Items.Add(id);
+            if (sel != null && actuales.Contains(sel)) cboIP.SelectedItem = sel;
+        }
+    }
+
+    string NombreDe(Registro r)
+    {
+        lock (lockDatos) { return NombreDeSinLock(r); }
+    }
+
+    // resuelve: nombre manual -> bd.md (por USER) -> numero USER -> maquina/IP
+    string NombreDeSinLock(Registro r)
+    {
+        string id = Identidad(r);
+        string n;
+        if (nombres.TryGetValue(id, out n) && n.Trim().Length > 0) return n;
+        if (!string.IsNullOrEmpty(r.User))
+        {
+            string nm;
+            if (usuariosDb.TryGetValue(r.User, out nm) && nm.Trim().Length > 0) return nm;
+            return r.User;
+        }
+        Fuente a = r.Activa();
+        if (a != null && !string.IsNullOrEmpty(a.MID)) return a.MID + " (" + a.IP + ")";
+        return r.Clave;
+    }
+
+    string FmtIdle(int seg)
+    {
+        if (seg < 0) seg = 0;
+        if (seg < 60) return seg + "s";
+        int m = seg / 60; int s = seg % 60;
+        return m + "m " + s + "s";
+    }
+
+    // ==========================
+    // Detalle de un trabajador (por hora + cada 2 min)
+    // ==========================
+    DataGridView NuevoGridDetalle(string[] headers)
+    {
+        DataGridView g = new DataGridView();
+        g.Dock = DockStyle.Fill;
+        g.ReadOnly = true;
+        g.AllowUserToAddRows = false;
+        g.AllowUserToDeleteRows = false;
+        g.AllowUserToResizeRows = false;
+        g.RowHeadersVisible = false;
+        g.MultiSelect = false;
+        g.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
+        g.BackgroundColor = Color.White;
+        g.BorderStyle = BorderStyle.None;
+        g.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
+        g.GridColor = Color.Gainsboro;
+        g.EnableHeadersVisualStyles = false;
+        g.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.Single;
+        g.ColumnHeadersDefaultCellStyle.BackColor = Color.White;
+        g.ColumnHeadersDefaultCellStyle.ForeColor = Color.DimGray;
+        g.DefaultCellStyle.ForeColor = Color.FromArgb(40, 40, 40);
+        g.DefaultCellStyle.SelectionBackColor = Color.Gainsboro;
+        g.DefaultCellStyle.SelectionForeColor = Color.Black;
+        g.RowTemplate.Height = 28;
+        foreach (string hh in headers)
+        {
+            int idx = g.Columns.Add(hh, hh);
+            g.Columns[idx].DefaultCellStyle.Alignment = DataGridViewContentAlignment.MiddleCenter;
+        }
+        return g;
+    }
+
+    void MostrarDetalle(string clave)
+    {
+        Registro r;
+        int hIni; int[] cnt; double[] cpm; int[] est;
+        string[] mHora; double[] mCpm; int[] mIdle;
+        string titulo, areaTxt;
+        lock (lockDatos)
+        {
+            if (!registros.TryGetValue(clave, out r)) return;
+            r.Combinar(out hIni, out cnt, out cpm, out est);
+            int n = r.MCpm.Count;
+            mHora = new string[n]; mCpm = new double[n]; mIdle = new int[n];
+            int j = 0;
+            foreach (KeyValuePair<string, double> kv in r.MCpm)
+            {
+                mHora[j] = kv.Key; mCpm[j] = kv.Value;
+                int id; r.MIdle.TryGetValue(kv.Key, out id); mIdle[j] = id;
+                j++;
+            }
+            Fuente a = r.Activa();
+            areaTxt = (a != null) ? a.Modo : "";
+            titulo = NombreDeSinLock(r) + (r.User.Length > 0 ? "  (User " + r.User + ")" : "") + "  -  " + areaTxt;
+        }
+
+        Form f = new Form();
+        f.Text = titulo;
+        f.Width = 440; f.Height = 540;
+        f.StartPosition = FormStartPosition.CenterParent;
+        f.TopMost = true;
+        f.Font = new Font("Segoe UI", 9F);
+        f.BackColor = Color.White;
+
+        TabControl tabs = new TabControl();
+        tabs.Dock = DockStyle.Fill;
+
+        // --- pestana: por hora ---
+        TabPage t1 = new TabPage("Por hora");
+        DataGridView g1 = NuevoGridDetalle(new string[] { "Hora", "Conteo", "CPM", "Estimado" });
+        int total = 0;
+        for (int i = 0; i < cnt.Length; i++)
+        {
+            int hora = hIni + i;
+            double c = (i < cpm.Length) ? cpm[i] : 0;
+            int e = (i < est.Length) ? est[i] : 0;
+            g1.Rows.Add(hora.ToString("D2") + ":00", cnt[i].ToString(), c.ToString("0.0"), e.ToString());
+            total += cnt[i];
+        }
+        Label lt = new Label();
+        lt.Dock = DockStyle.Bottom; lt.Height = 32;
+        lt.TextAlign = ContentAlignment.MiddleCenter;
+        lt.Font = new Font("Segoe UI", 11); lt.ForeColor = Color.DimGray;
+        lt.Text = "Total dia: " + total;
+        t1.Controls.Add(g1);
+        t1.Controls.Add(lt);
+
+        // --- pestana: cada 2 min ---
+        TabPage t2 = new TabPage("Cada 2 min");
+        DataGridView g2 = NuevoGridDetalle(new string[] { "Hora", "CPM", "Inactivo" });
+        for (int i = 0; i < mHora.Length; i++)
+            g2.Rows.Add(mHora[i], mCpm[i].ToString("0.0"), FmtIdle(mIdle[i]));
+        Label lt2 = new Label();
+        lt2.Dock = DockStyle.Bottom; lt2.Height = 32;
+        lt2.TextAlign = ContentAlignment.MiddleCenter;
+        lt2.Font = new Font("Segoe UI", 11); lt2.ForeColor = Color.DimGray;
+        lt2.Text = "Muestras: " + mHora.Length;
+        t2.Controls.Add(g2);
+        t2.Controls.Add(lt2);
+
+        tabs.TabPages.Add(t1);
+        tabs.TabPages.Add(t2);
+
+        f.Controls.Add(tabs);
+        f.ShowDialog(this);
+    }
+
+    // ==========================
+    // Nombres manuales (identidad -> trabajador). bd.md tiene prioridad si no hay manual.
+    // ==========================
+    void MostrarNombreDeSeleccion()
+    {
+        string id = cboIP.SelectedItem as string;
+        if (string.IsNullOrEmpty(id)) return;
+        string n;
+        lock (lockDatos)
+        {
+            if (!nombres.TryGetValue(id, out n))
+            {
+                if (!usuariosDb.TryGetValue(id, out n)) n = "";
+            }
+        }
+        txtNombre.Text = n == null ? "" : n;
+    }
+
+    void AsignarNombre()
+    {
+        string id = cboIP.SelectedItem as string;
+        if (string.IsNullOrEmpty(id)) { lblEstado.Text = "Selecciona un USER para nombrar."; return; }
+        string nombre = txtNombre.Text.Trim();
+        lock (lockDatos) { nombres[id] = nombre; }
+        GuardarNombres();
+        lblEstado.Text = "Nombre asignado: " + id + " -> " + nombre;
+    }
+
+    void CargarNombres()
+    {
+        try
+        {
+            if (!File.Exists(ArchNombres)) return;
+            foreach (string ln in File.ReadAllLines(ArchNombres))
+            {
+                int c = ln.IndexOf(',');
+                if (c > 0) nombres[ln.Substring(0, c).Trim()] = ln.Substring(c + 1).Trim();
+            }
+        }
+        catch { }
+    }
+
+    void GuardarNombres()
+    {
+        try
+        {
+            Directory.CreateDirectory(CarpetaBase);
+            List<string> ls = new List<string>();
+            lock (lockDatos) { foreach (KeyValuePair<string, string> kv in nombres) ls.Add(kv.Key + "," + kv.Value); }
+            File.WriteAllLines(ArchNombres, ls.ToArray());
+        }
+        catch { }
+    }
+
+    // ==========================
+    // Base de datos de usuarios (bd.md): "<id><espacios/tab><nombre>" por linea
+    // ==========================
+    void CargarUsuarios()
+    {
+        try
+        {
+            // 1) base embebida (o descargada) pasada desde PowerShell
+            if (!string.IsNullOrEmpty(UsuariosTexto))
+                foreach (string ln in UsuariosTexto.Replace("\r", "").Split('\n')) ParseUsuarioLinea(ln);
+            // 2) archivo local bd.md (extiende / sobreescribe lo embebido)
+            if (File.Exists(ArchUsuarios))
+                foreach (string ln in File.ReadAllLines(ArchUsuarios, Encoding.UTF8)) ParseUsuarioLinea(ln);
+            lblEstado.Text = "Usuarios cargados: " + usuariosDb.Count;
+        }
+        catch { }
+    }
+
+    void ParseUsuarioLinea(string ln)
+    {
+        string s = ln.Trim();
+        if (s.Length == 0 || s.StartsWith("#")) return;
+        Match m = Regex.Match(s, @"^(\S+)\s+(.+)$");
+        if (!m.Success) return;
+        string id = m.Groups[1].Value.Trim();
+        string nombre = m.Groups[2].Value.Trim();
+        if (id.Length > 0) usuariosDb[id] = nombre;
+    }
+
+    // ==========================
+    // Registro del dia (CSV) - por usuario, por hora
+    // ==========================
+    void GuardarLog(bool avisar)
+    {
+        try
+        {
+            Directory.CreateDirectory(CarpetaBase);
+            List<Registro> lista;
+            lock (lockDatos) { lista = new List<Registro>(registros.Values); }
+
+            List<string> ls = new List<string>();
+            ls.Add("Fecha,User,Nombre,Area,Hora,Conteo,CPM,Estimado");
+
+            string fecha = DateTime.Now.ToString("yyyy-MM-dd");
+            foreach (Registro r in lista)
+            {
+                Fuente a = r.Activa();
+                if (a == null) continue;
+                string nombre = NombreDe(r).Replace(",", " ");
+                int hIni; int[] cnt; double[] cpm; int[] est;
+                r.Combinar(out hIni, out cnt, out cpm, out est);
+                for (int i = 0; i < cnt.Length; i++)
+                {
+                    int hora = hIni + i;
+                    double cp = (i < cpm.Length) ? cpm[i] : 0;
+                    int e = (i < est.Length) ? est[i] : 0;
+                    ls.Add(fecha + "," + r.User + "," + nombre + "," + a.Modo + "," + hora + "," +
+                        cnt[i] + "," + cp.ToString("0.00", CultureInfo.InvariantCulture) + "," + e);
+                }
+            }
+            File.WriteAllLines(ArchLog, ls.ToArray());
+            if (avisar) MessageBox.Show("Exportado a:\n" + ArchLog, "Exportar", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex) { if (avisar) MessageBox.Show("Error al exportar:\n" + ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); }
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        try { listener.Stop(); } catch { }
+        base.OnFormClosed(e);
+    }
+
+    [STAThread]
+    public static void Main()
+    {
+        Application.EnableVisualStyles();
+        Application.Run(new ServidorTablero());
+    }
+}
+"@
+
+# ================================
+# Base de datos de usuarios (id -> nombre)  -- va DENTRO del programa
+# ================================
+# 1) Embebida: el programa se lleva la BD consigo (no requiere archivo ni internet).
+#    Para actualizarla puedes editar este bloque, dejar un bd.md al lado, o usar BD_URL (abajo).
+$bdEmbebida = @'
+566876	KENNETH THOMAS
+1006706	Andrew Habich
+1577877	DANA RENFROW
+1603620	CHAD HART
+1763551	Kevin Watty
+1848837	BRANDON HASKETT
+2027658	Jose McFarlane
+2047194	Kelly Germain
+3238810	Tonya Spegal
+3281865	Anna Bauman
+3286299	Ronald Eden
+3364117	HEATHER SCHMITT
+3652022	RANDY Rigdon
+3652451	ARMAND NEWTON
+3763357	Rickie J Rowland
+3781775	Tori Reynolds
+3791838	Jordan Dearmond
+3813731	Cheyenne Von Kanel
+3895730	Jeremy Lackey
+4052387	NIKOLAS SHERMAN
+4054296	Andrew Giles
+4193443	Jermaine Cooley
+4224331	CYNTHIA Rigdon
+4429846	Leidy Garcia
+4468298	Nayellie Herrera
+4496491	Llanos Yamilia
+4498318	Joshua Cross
+4565470	Christien Owen
+4732855	Leonardo Dorticos
+4758778	Safi Wammunga
+4811968	John Sloan
+4824659	Abdullahi Ali
+4839428	Angela Keene
+5060730	NICHOLAS M ZOELLER
+5070274	Christopher Neel
+5158587	Hinojosa Leydi
+5188474	CODY DOBSON
+5195827	Atyana Smith
+5499574	Steven Rosa
+5501998	TINITA DESHIELDS
+5541693	MARY TURNER
+5614042	Anton Harrison
+5633770	Joshua Chiles
+5645649	Zuhur Ali
+5915100	JENNIFER JOHNSON
+5923797	Donovan Mimms
+5968834	TEVANTE LEON
+5980208	paula alcorn
+5985384	Bellony Diamasse
+6000464	MARISSA LAYMAN
+6015760	Gabriel GONZALEZ
+6026882	Tynisa Purnell
+6026889	Yosleidys Perez Rodriguez
+6041192	yusmara yusmara cordova
+6050160	Yolanda Chaveco R
+6181026	Marino Sanchez
+6280444	Jesenia Andujar Ramos
+6327740	MARIA AGUILAR
+6353887	Ali Reslan
+6365667	Jacqueline Garcia Sosa
+6380639	Juan Urquiaga Suarez
+6381815	Hodhan Bille
+6435975	Monica Gonzalez
+6451043	MARISOL GAYTAN ROJAS
+6455848	Adam Gallagher
+6461651	Miloge Michel
+6474087	Milena Fernandez
+6501898	Savannah Watkins
+6520378	Stephanie Wilson
+6535318	Michael Tankersly
+6552182	Jessica Hope
+7012833	Harry Fumero
+7039769	Bonke Nzabaho
+7062538	Nastia Perez fonseca
+7141653	Kylar Poole
+7160887	Lalimbo Nyota
+7232016	Kelsey Bickman
+7252942	Aaliyah M Annibal
+7261190	VALERIA GUERRERO
+7272348	Makhia Gaddie
+7272642	Iris Guilbert Garcia
+7279564	Lazaro Pena Ramos
+7281340	HECTOR DIAZ
+7283802	Janvier Twizere
+7286516	Cayelyn Johnson
+7286553	Sara Mulalic
+7290014	Damon Mumford
+7292270	Augustus Wilson
+7292717	Mairelys Garciga Garcia
+7296556	Francine Nakirindo
+7303953	Kiza Nyota
+7311347	Glausy Garcia Claver
+7325304	AMANDA REICH
+7327136	Renier Lastre Machado
+7329899	Michaela Keller
+7331275	James Knoll
+7335619	Kevin Cardona
+7339896	TOMMY HAMMOCK
+7355895	Lowe Brandon
+7357683	Yanet Reyes Correa
+7358567	BITETE MAURIDI
+7372362	Courtney Coomer
+7379379	Ana Figueredo Leon
+7390087	ALAIN MUSIMBWA
+7391994	Amanuel Gebremedhin
+7400380	Charllotte Trulock
+7405582	Maylin Fonseca
+7412500	Geovanis Miller
+7419793	NYASHIMWE MBIYOMBIYO
+7427942	Carlos Lopez
+7436439	Wilson Vazquez
+7459937	francoise nyamwiza
+7479214	Francois Beauvil
+7523409	Kelsey Sice
+7552935	Zawadi Nyirantungane
+7590949	CHRISTINA JOHNSON
+7598098	Matumona Clemente
+7647480	Juana Ruiz
+7647560	habiba h muya
+7655912	PAMELA BAKER
+7713877	Alice Cyiza
+7718401	Leslie Betancourt
+7718412	MELANY MOREIRA
+7718457	ROBERT DELGADO
+7720279	SHELBY SKAGGS
+7721224	SIGFREDO PACHECO
+7732181	Samantha Perez
+7737097	Joel Satin
+7744839	Armando Becquer
+7745028	yaime de la maza nordelo
+7745642	Jacob Risner
+7752601	DAIRYS GUERRERO
+7776016	DARRICK MITCHELL
+7777355	JOHN HAZELWOOD
+7783563	Dana Gibson
+7794376	Jerrica Battle
+7805808	Joel Jorro Oropesa
+7811923	VICKIE L TORRES
+7814129	Dylan D McGaha
+7817421	Alexka Ibanez
+7818615	Jocelin Napoleon
+7826034	Adislubia Torres argota
+7830138	Angel L Ramos Castillo
+7830149	Maikel Fabier
+7831088	NAVARRO ALEXIS
+7834821	Stormi Jones
+7847379	John Foote
+7848990	KAYLA HOLSAPPLE
+7871215	Carlos Gonzalez
+7880006	KYLE MCKINLEY
+7880011	TIFFANY ALLEN
+7888561	Alexander Fajardo
+7890317	TIMOTHY REDD
+7890325	JORDAN SHARP
+7895350	Bryan pino
+7897167	Justin Sharp
+7942425	Barbaro Garcia
+7942438	Maribel Driggs Dagneses
+7948111	Patricia l Mathis
+7978828	Yaisel Vega Salgado
+8080690	Ali Mohamed
+8097150	ARANELIS RODRIGUEZ
+8112124	HECTOR JOEL FELICIANO OCASIO
+8136797	Charles Perry
+8143969	Kevin Nunez Fuentes
+8155938	Yvonne MarieCastlman
+8165923	Velmiliz Pachero
+8169887	Elizabeth Gonzalez
+8180155	Anita Besongo
+8182319	Yaiset Velazco
+8191009	Anthony Hernandez
+8194115	Jordan M Fabre Machado
+8194737	Miguel Garrote
+8200284	ANNE BESSE
+8201395	ROBERTA LYNN PEKOCK
+8206137	SANDRA BAXTER VERTREES
+8206409	Ramon Reyes Aroche
+8209204	Bryce Pressler
+8210200	YASMANI ROD RIGUEZ PEDROSA
+8211147	ERIC GFALCON
+8211652	EDILDA GONZALEZ PASCUAL
+8212094	Pacifique Mugisha
+8213025	Rolando Zequeira Perez
+8213699	Emil Rabilero Mellina
+8213706	Jose Cardoso
+8214423	ADRIEL MESA LIC
+8214692	Daneyis Olivera Varona
+8214695	Yudisleydis Franco Rodriguez
+8214696	Michel Morales
+8214720	LEOPOLDO ACANDA PAINO
+8214723	CARLOS BATISTA QUEVEDO
+8215715	Dayana Rodriguez
+8216542	GEORGE MATUTE
+8218224	Jose Nunez Rodriguez
+8219894	VILMA RAMIREZ
+8220152	ENIDE JEAN
+8220180	Yulia Pena Diaz
+8220357	Yudisney Martinez
+8221513	Leandro Mejias Gonzalez
+8224394	Tharcisse Munyankindi
+8227281	Addiel Naranjo Centeno
+8227300	ST OBAIN JOSEPH
+8227302	RAHWA ABRAHA
+8227899	Yohandry Hernandez Perez
+8227902	Mariela Mendosa Tamayo
+8227914	Ernesto Castaner
+8231435	Antwan Duncan
+8232407	Abdikadir Chivala
+8235259	Adrian Martinez Alonso
+8236375	NELSON C MARZO
+8237489	Aralis Molina
+8237519	Yannaris Calder Martinez
+8237521	DEYSI RAMIREZ DE PADILLA
+8239138	Reynier Lopez Garcia
+8239163	Ruben Palacios Cervantes
+8239198	roxana cabrera gomez
+8252569	Yuriselis Acosta
+8261595	Yanet Ricardo
+8262089	Jelin Moreno Olivera
+8274546	Heather Huffman
+8276684	Yuliet Segura
+8279768	Abel SMartinez
+8279838	Glenys Arias
+8279854	Yudelcys Rodriguez Cuevas
+8284478	Adriana Cobas Marquez
+8302259	Maria Rodriguez
+8304954	Yuleidy Aguero Lozada
+8322636	Yuan G Arias Corona
+8329441	Nick Henry
+8338592	ORLAND RICARDO VELAZQUEZ
+8350591	Camren Johnson
+8356747	Yordanos Abraha
+8356778	Leisa Duharte Coello
+8366855	Joel Catlyne
+8401550	Marianny Pena
+8413788	ODALYS COLON DIAZ
+8413795	Carlos Mederos Reinoso
+8455358	Yurania MRodriguez
+8462342	Jacoby T Summers
+8498709	Michae Mathis
+8502360	Emmanuel Lawrence
+8503134	ALICIA SUAREZ
+8504297	Roselia Rodriguez Sanchez
+8504531	Ahmed Aljizani
+8507945	Scarleth Dolmos Navarro
+8510384	Linieski Rodriguez
+8511613	Maria Espinosa Mena
+8511622	Rodolfo Ochoa Perez
+8512352	Duliani Ramos
+8516089	Woogen Loo Urrely
+8518180	YUMILA LAGO BERMUDEZ
+8518185	Lisandra SosaDiaz
+8518355	Cassandra Bruno
+8544734	Abigail Christian
+8546009	Rodolfo Palencia
+8546086	Renel RParra
+8546090	Jorge F Lorenzo
+8550131	Misleidy Aleman
+8550522	MIGUEL NCARRAZANA
+8550550	Solang Benitez Riveron
+8552222	Yinet Martinez
+8554593	Sheila Rodriguez Sanchez
+8555875	Jorge Prado
+8555880	Yurisleydis Toro Molina
+8555882	Antonio Benitez Guerra
+8557341	Sandra BPena
+8559385	Orlando Fuentes
+8569766	Cristhian Gomez Leyva
+8569784	Sindya Romero Perez
+8570232	Estephanie Martinez
+8570869	Alliance Karatuje
+8571208	Blake Grasch
+8603038	Yosmel Banos Aleman
+8603047	Carolina Socarras
+8611280	Abou Cisse
+8611961	Chrislaine Lafond
+8628158	Laura Perez
+8629668	CHRISTIAN LCERUTO
+8642070	Gleydis VTase
+8694843	YANNY GARCIA CARABALLOSO
+8694866	Arisnelis Vazquez
+8694875	tania milagro paneque paz
+8744310	Aime Ferrer Veris
+8752098	Ricardo Larrudet Barcelay
+8768861	Ahmed Hernandez
+8775596	Demydenises Quevedo
+8775603	Osmany Jimenez
+8779423	Melissa Milanes
+8779435	Ariel Argota
+8819923	Yvens Charles
+8824471	Yuleisi Pinero
+8828799	Mostapha Mbacke
+8850722	Napoles DNunez
+8856665	Hidalgo Batista Franklin
+8887055	Yakelin Urdaneta
+8898875	Yudis Perez
+8918189	Deisy Legon Contreras
+8935540	Suzanne Lee
+8939342	Yuneski Jorgen Arias
+8950062	Neris Reyes Batista
+8951324	Scott Roach
+8957158	Sheila Suarez
+8957168	Nereida Hernandez
+8957307	Cierra Long
+8957533	Estefani GYanez
+8959841	Jorge Suarez
+8959883	Edwin Perez Jimenez
+8960198	Dalgis Perez Carralero
+8962171	Catelin Helm
+8963458	Maikel Patino Rivero
+8963474	Adriana Figueras
+8964675	Abdourahamane Barry
+8972300	Yanira Rodriguez
+8972318	Luis Gomez Martinez
+8973787	Yulied Redondo
+8975525	Dayanara Cruz
+8975958	Samia Annour
+8982709	Marlen Zelaya
+8982719	Yordanka Garcia
+8983621	YUDISLEDIS GOMEZ
+8984747	ReginaDelMar Ramirez
+8984750	Perez Yordanka
+8984755	Veronica beltran
+8984826	Dayami Escoda
+8984844	MariaPassword-1 Lorenzo
+8984873	Addel Aguila
+8986317	Lisle Peraza
+8987072	Edouard Hitimana
+8988340	SHINILOVE TERTILD
+8988361	Raul BClaxton
+8988376	BELKIS PICABEA
+8989604	Thery Zelaya
+8990084	Ismaily Escalona
+8990093	Orquidea Galban Montero
+8993368	Adriana Sobredo Fernandez
+8993855	Alan Amatbakri
+8994354	Mayra Carrillo
+8994385	Franggelis ALopez
+8995314	Irdelis Santiesteban
+8996547	Miguel Anibal Fernandez Per
+8996572	Dariel VGomez
+8996988	Anthony Bernal Bruzon
+8997464	Thalia Rios
+8997472	Fidel Vega
+8997480	Osvaldo L Simon
+8997488	Iliety Medina
+9000626	Yanetsy Abreu
+9000760	Irmarys Noriega
+9001911	Idalmis Betancourt
+9001928	JOYCE AUGUSTINE
+9001951	Enna Alvarado
+9001957	Gloria Asto Ccanto
+9003775	Vianet Gonzalez Morera
+9004171	Yelenis Valera
+9004190	Rosangela Escalona
+9004194	Claudia Duran
+9004214	Yandri Velazquez
+9004216	Yilmar Smith
+9004628	Jeanine Muhoza
+9004644	Yuliet Baez
+9005714	Mayda PLeon
+9005754	Daniela Manzo Quiala
+9005761	Regis Mwungura
+9005766	Victoria burgin
+9005771	AnaMaria RFerrales
+9007234	Francis Santana
+9007609	Yamirka Herrera Garcia
+9007621	Faustin hakizimana
+9007637	ANAELY RODRIGUEZ
+9010553	Mary Rodriguez Rodriguez
+9010872	Marilyn Leon
+9010901	magatte toure
+9010904	Magalys Aguilar Rodriguez
+9010910	Islande Desgranges
+9011164	Yoelkys Corria
+9011175	Eliecer Estrada Lopez
+9011344	Andry Quintero
+9011353	Jose Enrique Scott
+9012404	Ludmila Fuentes Gonzalez
+9012406	Milagros Prieto Miranda
+9012434	Kevin Wix
+9013649	Nila Maonyesho
+9013655	jason Reyna ortiz
+9013662	Jorge Gonzalez Hernandez
+9014106	Leticia Cruz Batista
+9014116	Yailen Vega Diaz
+9014355	Carbonell Manuel
+9014357	RUBER RACOSTA
+9014360	nirere angelique
+9014373	Nestor Velez Chacon
+9014488	MarieNdiaye Cheikh
+9014500	Yuliet Acosta Rodriguez
+9014509	Melody Rodriguez Ferrer
+9014522	Algeciras Yaime
+9015989	Yedier VTorres
+9015996	Candida Pinon Villasante
+9015998	Axel Vibbert
+9016003	Babacar Ka
+9017275	Mario Saint
+9017638	Ian Nunley
+9033493	Ismely Garcia
+9033494	ASHLEY JOHNSON
+9044035	Barbera Carlos
+9048483	Francine Pucket
+9053477	Carlos Duenas
+9061442	saidy sanchez
+9076942	Shyanne George
+9076944	Luisa Munoz Sanchez
+9076956	Frelouse Blanc
+9076958	ndizeye jacques
+9076971	Yamilce Leyva Dominguez
+9076974	Angelani Abongyo
+9081651	Gabrielle Burnett
+9102295	Veliz Cutino
+9133578	Damien Henn
+9149153	Meybel Alejo
+9149159	Samara Cox
+9156439	Elta cadeau
+9156470	Kenia Tamayo
+9190551	henock mbanzangu
+9194408	Kyle Stueve
+9197639	juan almaguer cabrera
+9197657	keith martin
+9197662	Cindy Portuondo
+9197679	dainier parra
+9225322	Shiekhnur Mberwa
+9240817	Daynel Rodriguez Alonso
+9240819	Nyiraisha Ingabire
+9240823	Roxana Romero
+9243194	Neil Lubusa
+9247711	Brenda Cachaya
+9247757	dayami Santacruz
+9256516	Jean D Nicolas
+9261347	Martin Alvarez Perez
+9261352	Zaida Yera Acosta
+9261381	Sandra Carney
+9261383	Kelvin Solis
+9274073	LIZANDRA GUZMAN
+9286112	Esther Nzitabakuze
+9286128	ethan clark
+9286129	Abisael Senteno
+9292428	Zamantha Varona
+9292455	Katiuska Alcina Carmenate
+9314801	Alejandra Gonzalez
+9314805	Raul Traba Cabrera
+9318729	Daniellis Alvarez
+9328839	Garcia Kevin
+9338893	Elianis Gonzalez
+9338894	Claudia Acuna Concepcion
+9341080	Ana Turcios
+9346704	Dustin Ahl
+9349993	JOSE SALINA
+9350411	sabiha boubrit
+9350720	Yailenys Reyes
+9351105	Necola Burks
+9351462	ESTIME BERNADE
+9351605	DARLIN RUIZ
+9351613	Catherine Castellanos Claro
+9351631	Edda Morales Vila
+9352051	Niurvis Claro
+9352183	Bernardo Calzadilla
+9352187	ALEXIS PENA
+9354648	JAMES HUMPHREY
+9354652	KARINA ALBERTO
+9357333	Demetrius Mack
+9357336	Odalys Cruz
+9358087	DIANA Leyva
+9359434	MARIA SORIA MATAMOROS
+9359505	Viviana Vasquez
+9359529	Juan Valenzuela Peralta
+9360299	Claudia Mendoza
+9361052	Dairys Pena parra
+9361907	Erick Piedra
+9363095	marieme ndoye
+9363178	Woulio Foulcal
+9364020	Jose Ruiz
+9365565	Isa Amir
+9365647	Luwam Abraha
+9365659	Jorge Rodriguez
+9365661	Dorothy Hardin
+9365662	Courtney Hardin
+9365663	Saira Santiago
+9365697	Dohanny Gonzalez
+9365699	Rebka Gebreyohanes
+9365719	Zelibeth Rios
+9365720	Kevin Esquivel
+9366125	Alejandra Ricardo
+9366127	Nikolas Jansing
+9366128	Kendry Velazquez
+9366209	Diana Monteagudo
+9366267	Aliuska Batista
+9366276	Rosmery Ramirez
+9366461	Wilondja Kiza
+9366489	Daniel Alvarez
+9366545	Idania Regalado Bello
+9366562	Alejandro A Benitez
+9366727	Idania Garcia
+9366801	Bill Jonhson
+9366880	Maria Parada
+9366914	Abdoulaye Mboup
+9366921	Manneau Labady
+9366922	Nadine Labady
+9366923	Yilena Zapata
+9367021	DARIELLIS LOPEZ
+9367078	Daylon Gonzalez
+9367529	Odelkis Moreno
+9369109	Yeison Rosales
+9369138	PAOLA MOORER
+9369140	Lory Saintelmy
+9369208	Zulling Gomez
+9369209	Yuleidy Cruz
+9369318	Isaray Reyes Rodriguez
+9369333	Martin Kumbu
+9369346	Jose Duran
+9369417	Steve Victor
+9369696	Tiriza Tiriza Munyarugendo
+9369705	Legna Cuervo Leyva
+9369810	Karen Rivas
+9369906	Labar Meheza Badaboh
+9369919	Samba Samba Diop
+9369924	Scott Edward Ross
+9369942	Ania Perez
+9370622	Giselle Dillard
+9370901	Jonathan Jonathan Rodriguez
+9371118	Jose GonzalezSantiesteban
+9371264	Roberto Aguilera
+9371472	Elia Garcia
+9371475	Elianis Almaguer
+9371722	Esther Timaure
+9371944	Worlds Jerryson Lebrun
+9373365	Dakota Sweeney
+9373368	Mireille Michel
+9373467	zuhura kashindi
+9373493	Elizabeth Tumushime
+9374010	Ignacio torres acosta
+9374220	Elena Guerra Perez
+9375549	Maibelis J Azuaje
+9375603	Soemily Fernandez Paz
+9375616	Malaki Briscoe
+9375642	Afi Afidegno
+9375791	Gilberto Zamora
+9375793	Gilberto Guanche
+9375796	Maryama F Duale
+9375813	Minouche Massillon
+9376051	Alain Rosales
+9376052	Yonis F Funes
+9376161	Joseph Brewer
+9376332	Yamilet Perez Hernandez
+9376455	Yves Ngirumuvugizi
+9376587	Jennifer Turman
+9376720	Mariana Marroquin Ramos
+9377023	Chabeli Rumbaut
+9377039	Justin Stillings
+9377194	Gloria P Valera
+9377195	Sheyling E Mendoza
+9377196	Dieunita Raymond
+9377197	Madisleydis Linares Salazar
+9377461	Yosvany Del Sol Cruz
+9377468	Cameron Wood
+9377469	Rita Dorsey
+9377471	Alexis Perez
+9377642	Hiberto Forte
+9377644	Nicky Gihozo
+9377651	Alfred Guerrier
+9377652	yurisleivy perez perez
+9377653	Rosario Pantoja
+9377654	Rosa M Arredondo
+9377657	Nelson Del Valle
+9377658	Marie Denise
+9377659	Nelda Prinzon Vaca
+9377703	Salet Vive Barat
+9377764	Maria Aguirre Ayala
+9377765	Christopher Sweeney
+9377766	Ilsia Morales
+9377767	Nema Bamjan
+9377769	Dianelis Santiaguez
+9377770	Jean Pierre Muteba Ntambwe
+9377771	Natacha Diuessaint
+9378744	Ibrahin Rodriguez
+9378937	Yudisleyna Diaz
+9378946	Hussein Khamis
+9378948	beatrice mabe
+9379066	Ingrid Bautista
+9379071	Beda I Monga
+9379073	Nangena UNGWA
+9379135	Abshir Mohamed
+9379136	Felipe Abisaad
+9379137	Rosali Conde
+9379142	Liliana hernandez
+9379405	Magda I Coba Mosqueda
+9379407	Rosabel Perez Gamez
+9379416	Eliecer Gonzalez
+9379423	Alexis Herrera Palacio
+9379645	Georgette Manga
+9379679	Jeffly Dejustin
+9379692	Dailyn Campos
+9379693	MAGGIE MARIN
+9379934	ECA Alumbe
+9379968	Gabriel Copenhaver
+9379972	Sara Barker
+9380112	Danilo Anjos Braga
+9380275	Maikel Jimenez
+9380276	Barbara Gamez Batista
+9380277	Peterson Torchon
+9380287	Sheila Hermoso
+9380307	Taimi Robles Fuentes
+9380308	Ariagna Guerra
+9380327	Arquimides Batista
+9380329	Sandra Cruz
+9380333	Danel Gonzalez
+9380689	Alina Morales
+9380691	Makela Rodriguez
+9380742	Adrianyi Morales
+9380749	Ester Vazquez
+9380758	Mirelys Prieto
+9381477	Leodan Viamontes
+9381539	Emerson Hernandez
+9381542	Lisban Hernandez
+9381545	Bory Hernandez
+9381610	beatriz de la cruz
+9381641	Yonatan Tornell
+9381644	Mercedes garcia
+9381648	Laura Bolufe Garcia
+9381649	Maria Moreira
+9382217	Sonia Hidalgo
+9382218	pedro socarras castillo
+9382495	Lorena Mejia
+9382496	Anibal Padilla
+9382506	Jeramie Smith
+9382841	Arelis Suero
+9382851	Ronaldo Rodriguez
+9383382	Yan Jimenez Aguilar
+9383383	Yaimara Gonzalez
+9383430	Yesenia Armas Solis
+9383431	Ricarda Perez Martinez
+9383466	Claudia Cabrera
+9383478	Ismael Ismael Iglesis
+9383479	Neftali Neftali Morales
+9383642	Sandro Pino Vazquez
+9383681	Reidel Castillo
+9383682	Maddiel Vega
+9383683	Arisdelky Marrero
+9383684	Mairim Rivero
+9383685	Odelky Silva
+9383713	Eudis Sanchez
+9383714	Pedro Goberna
+9383715	Thalia Alejo Tr
+9383729	Fatumo Fatumo Juma
+9383731	Maybis Liana Leyva
+9383732	Irene Irene Armas
+9383734	Eliceo Noa Villanueva
+9383758	Wilfredo Guerrero sanchez
+9383759	Yurdamy Gonzalez
+9383777	Cecilia Diaz
+9383778	Santiago Torres Barreiro
+9384466	Yesdesi Aguilar Reina
+9384471	Teresa Rondon Vargas
+9384537	Reynaldo Leyva
+9384717	Yinaisi Lamote Garcia
+9384718	Radael Aguilera
+9384719	Karelia Rizo
+9384909	Mabel Cuellar
+9384910	Grace Uwera
+9384991	Adelaida Correa
+9384992	Tomas Benemelis
+9385651	Richard Ellis
+9385670	Ervira Feliz
+9386005	Mercedes Planes
+9386018	Nancy Cardona Acosta
+9386020	Kerelin Perez Pena
+9386126	Roxana Sarmiento Perez
+9386131	Yordanis Cespedes
+9386147	Jean Bulema
+9386148	Lusenie Bernardin
+9386151	Yuleisy Suarez
+9386318	Rosell Guerrero Bejerano
+9386319	Karenia Lores
+9386904	Flavia De La Hoz
+9386910	Milagros Sanchez
+9386941	Fabiola Riojas
+9389966	Taika Derat
+9390341	Marialis De La Cuesta
+9390390	Patricia Matlack
+9390448	Angel Toledo Pupo
+9390450	Elena Mac Cullock
+9390451	Yadira Trimino zamora
+9390453	Yunieski Alba
+9390457	Danitza Guzman Sanchez
+9390546	Angel Villalobos
+9390548	Marlien Soca Leon
+9390549	Steve Breeding
+9390723	Beatriz Montero Palomo
+9391017	Ineva Perez Aguila
+9391057	Daniela Gallego
+9391298	Victor Serrano
+9391339	Beatriz Perdomo Batista
+9391341	Ana Gonzalez
+9391363	Reinaldo Espinosa Justiz
+9391392	Taelor Long
+9391802	Paula Watkins
+9391803	Makenzie Fravert
+9391806	Arianna Gonzalez
+9392000	Yanelis Leon
+9392007	Yoenia Rodriguez
+9392019	Eleusys Gonzalez Benitez
+9392021	Yaniusky Capote
+9392022	Yunior Espinoza
+9393328	Yarelys Barrios
+9393826	Yerilin Lopez
+9393938	Erin Hardin
+9394095	Abdul Henry
+9394803	Yolanda Perez Ramos
+9394925	Berta Ferray Rodriguez
+9394929	Rene Corres Perez
+9395106	Gregory Jackson
+9395919	Daniela Cruz Batista
+9395921	Sandy Ballaga
+9396064	Felix Zamora Sainz
+9396139	Yarenis Zaragoza Garcia
+9396140	Yuniel Piedra
+9396142	Ousmane Gaye
+9396338	Maria Garay Benitez
+9396369	Lisbeth Rochart
+9396843	Lianna R Crespo
+9396845	Maria Mtambala
+9396857	Gloria Sarquiz Gonzalez
+9397505	Yanexi Lora Suarez
+9397750	Reynaldo Cadahia Mirabal
+9397751	Maria Sanchez
+9397754	WILLIA HOUCINS
+9397885	Asiel Paneque
+9397886	Bahati Bisore
+9397887	Alitha D Dorsey
+9397909	hector villegas
+9398237	Justin Tuyishime
+9398268	Yilliam Cuellar Sarmiento
+9398293	Marlene Paz
+9398294	Maria Quijano Moreno
+9398595	Yiccy Pineda
+9398597	Caleb Tanner
+9398639	Mason Morton
+9398641	Dametri Eaton
+9398767	safa abubaker
+9398769	Fidel Veloz Rodriguez
+9398770	yennye rodriguez perez
+9398771	Robert Robinson
+9398775	Favreau Kaelin
+9398787	Juan Avalos
+9398841	Karla Cana Blanco
+9398842	Mileidy Abreu
+9398874	Enrique Corrales Otano
+9399120	Romina Riffarachi
+9399121	Consolee Neema
+9399122	Kyvion Sanders
+9399124	Natacha Dieussaint
+9399125	Carlos Ramos
+9399129	Janviere Nishimwe
+9399143	Joseph Bell
+9399365	Miguel Cala
+9399367	Graciela Nunez
+9399372	Madelayne Toledo
+9399373	Resadnela, Guerra Quesada
+9399374	solange irankunda
+9399375	Carmen Izaguirre
+9399413	Alex Joseph
+9399993	washikala mtambala
+9400073	Romaine Prophete
+9400079	Dalgis Cuellar Fernandez
+9400232	Maleigha Milledge
+9400295	Cristian Ordonez
+9400763	Ana Carralero
+9400779	Kenneth Hardin
+9400780	Mathieu Joseph
+9401220	Faustin Shema
+9401467	Yorvi Gimenez
+9401469	JaVan Ditto
+9401624	Alejandro Marino
+9401626	Gilet Isme
+9401627	Crystal Griffin
+9401628	Anna Bukumba
+9401629	Paul Brown
+9401632	Dana Johnson
+9401658	Lul Gudal
+9401667	Buraco Hussein
+9402414	Manuel Casi
+9402577	Mutesi Olive
+9403020	Bridget Alvarez Perez
+9403136	Leaha Wilson
+9403156	Gary Woods
+9403802	Theotis Riddle
+9403826	Cristian Gomez Arias
+9403976	Benita Nzinga
+9404034	Yolexi Cancio
+9404061	Jonny Amaro Acosta
+9404481	Rosalia Lopez
+9404631	Yordis Garcia
+9404655	daylin perez
+9404656	Jessica White
+9404658	alexander gonzalez
+9404661	Jorge Avila
+9404662	oder perez
+9404664	Ilser Pineda Vargas
+9404940	Isabel Esturain
+9405548	Martha Carballosa
+9405549	Reyner Guiterrez
+ACARO	Adam Caro
+ADIEDRICH	AMANDA DIEDRICH
+AHOPFNER	ANTHONY HOPFNER
+AJOHNSON	ANNA JOHNSON
+AKINNAIRD	Austin Kinnaird
+AMORENO	ARIEL MORENO
+AOCHSNER	ALISON OCHSNER
+AOY1CXX	SARAH RUSHING
+ATAYLOR	Antonio Taylor
+AUO1YMM	Dana Matlock
+AYA1DNN	Ryan Forbis
+AYI1FYY	Clay Cheser
+AYI1WXX	TINA CZMOWSKI
+AYI1ZXX	Jergerald Davis
+AYO1DWW	Scott Blandford
+AYU1NNN	Scott Ashcraft
+AYU1TSS	Robert Barnes
+AYU1ZMM	JASON BENNETT
+BBOURDEAU	BRITTANY N BOURDEAU
+BCHABAN	BEATRIZ CHABAN
+BGT7ZDZ	GIORGIO SAADE
+BIEYE	Bianca Eye
+BLONG	BRINDEN LONG
+BMS3WGK	JESSICA Waynescott
+BPEREZ	Blanca Perez
+BPT1TNY	GLORIA GLORIA
+BQH4JYK	Soni Sharma
+BSWARTZ	Bryan Swartz
+BWELLS	Britney Wells
+BWS0KBS	Keith Holmes
+BZF0CJY	MANISH MATHUR
+CCY7KVG	Mark Hatfield
+CFLEMONS	CHRISTEN FLEMONS
+CHD5FRK	AHMED KHWAJA
+CQS0TSB	SWETHA J
+CR101376321	Warren Rucker
+CR104627381	Corey Meadows
+CRN95708178	Jared Smith
+CSN8HRQ	Paulo Santilli
+CVASQUEZ	Carla VASQUEZ
+CVT3LTD	SAUNDRA BROWN
+CWR4MKW	Yuvaraj Rupeswar
+CWS0BJZ	Elangovan Rajendiran
+CWZ1NGY	Andrew Sellers
+CZM4LCH	Durga Prasanna Mummineni
+DAGUIAR	David AGUIAR
+DCOCKERILL	Devin Devin Cockerill
+DDORESTANT	DENSON DORESTANT
+DNS3LRJ	Vasu Vasudevan
+DRX5LSW	Tim Boyd
+DSMITH	Derrick Smith
+DTK3VDC	Emily Hyde
+EAE1PGG	Gary Faber
+EARAUJO	EVER MENDOZA ARAUJO
+EEU1SFF	Nancy Costa
+EEY1CLL	Tony McGlasson
+EEY1CRR	Judith Rogers
+EROJAS	Eulice Mestre Rojas
+FDURAN	FRANK DURAN
+FJM3GBF	Jamsheer Abdul Latheef
+FKZ9VTF	SHAHAB AHMAD
+FMD4QDF	Swathi Challa
+FQG1SWP	James Howell
+FVB1ZZD	TYRON SISTRUNK
+GBZ4JFF	Bryan Williams
+GDV7GWT	Kevin Stanley
+GGC2WJK	Shubham Sharma
+GTQ5HWD	PHILLIP WESTERN
+GTW8JWJ	Jennifer Oughton
+HALI2	Hassan-Nur Ali
+HAWAD	HAFSA AWAD
+HBD6YKN	Anuj Narang
+HCC1RXK	RAJIV KARUNAKARAN
+HCS6PBM	ZAHRA BODLA
+HGC3LKG	DAVID KUBIK
+HHICKS	HARVEY HICKS
+HJL8BTD	Joey Vincent
+HMB4GWZ	PRAJITH PARAMESWARAN
+HTV4WKF	Aiswarya Ravichandran
+HTZ5JXZ	Chikoti Sai Teja
+HVROMAN	Heather Vroman
+JBALAEZ	JOSE E SANCHEZ BALAEZ
+JDS0LSJ	Nanki Jhamb
+JEDAVIS	Jennifer DAVIS
+JELMORE	JASON ELMORE
+JFARMER1	JO FARMER
+JFQ5PPS	Wyatt Higbee
+JGRIVAS	Jennifer GRivas
+JJH1QQM	Arivarasu Palaniappan
+JLANCASTER	JASON LANCASTER
+JNAVARIJO	JENMY HERRERA Navarijo
+JROBINSON2	Jairahmai Robinson
+JSCHROEDER	JEFFREY SCHROEDER
+JTD0LWZ	mani marank
+JXL4DLK	Mohammad Anjum
+KJH1BRM	BENJAMIN MENG
+KLL9EMB	Ella Barron
+KLOSCH	Karen Losch
+KRISHKOFSKI	Kerry Rishkofski
+KTW4QSB	Kalaivani Ramalingam
+KWISE	Katrina Wise
+KWS0MDP	Jyotrimaya Swain
+LBV4FLH	DAKOTA HOKE
+LDIAZ2	LIZANIA DIAZ
+LDN2JKH	Preethi Sri SK
+LDOTSON	Larry Dotson
+LDY2HPK	Andrew Disalvo
+LFALCON	LESLEY LEONOR GONZALEZ FALCON
+LLUNA	LILIET BRUZON LUNA
+LMB9TRS	DANA HELM
+LMCDERMOTT	Lisa McDermott
+LMORALES	LEONARDO GUERRA MORALES
+LVENTURA	Lucia Cordova
+LXR1QKZ	KYLE SCHUETTE
+MBP0GGF	Aishwariya Soundararajan
+MBQ4TKB	Brian Riffle
+MCAMPO	MARIELA MERCADO CAMPO
+MCHOL	Monica Chol
+MDX5ZPS	AARON GLENN
+MFIGUEREDO1	Michel Torres Figueredo
+MGILBERT	Marsha Gilbert
+MHINIJOSA	Irma MHinijosa
+MMC1HSD	Daniel De La Cruz
+MMCCOY	Michael McCoy
+MROMERO	MARCO ROMERO
+MTOVAR	MILITZA C TOVAR
+MWW1JXA	Jimmy Allen
+NCM7TLT	SHAYLA MEANS
+NGH5SBG	Suvada Siljkovic
+NNADUKUN	NATALIA NADUKUN
+NQW2KFS	Sajimi Sasi
+NWV1MDC	Daniel Adams
+OSANTOYA	ODELSIS MEDERON SANTOYA
+PBORJA	PATRICE BORJA
+PDS5TFD	Kyle Buckels
+PKH9SGP	Randall Moya
+PML3XDB	ANGELA HUMPHREY
+PMUNYAKAZI	Philomene Munyakazi
+PPS0RPY	Mekala Shanmugam
+PPV4SCR	Joseph Hall
+PTC5LFS	Saravanan Velayudham
+PZR1TLG	KOWSALYA P
+QDF1WQQ	David I Miller
+QDN8NRV	AUSTIN FIELDS
+QGC3MPT	Ashok Ganapathi
+QKP9XWM	Steadman Waller
+QLR5ZGN	Nick Neville
+QML6QFQ	William Lee
+QNY2GSP	Muthu V
+QTS1LNS	ANDREW COX
+RCESPEDES	ROXANA BATISTA CESPEDES
+RDS5FKQ	KENNETH FOSTER
+RHAYES	RACHELLE LYNN HAYES
+RHS0SDT	Vaishnavi Raskar
+RMONTGOMERY	Regina Montgomery
+RNL9ZJM	William Lee
+RNR0ZWQ	Cheryl Rauen
+RTT4QGR	Rinkita Mohite
+SDOUGLAS	Sarah Douglas
+SFTSUPPORT	Soft SUPPORT
+SGEORGE	SAVANNAH GEORGE
+SHY4HTW	JASON HARTLAGE
+SKQ8HVJ	DAWN MILLER
+SNN4SSB	Shane Bianculli
+SROCHA	Samuel Galban Rocha
+SSHERMAN	SHELBY SHERMAN
+SWG5GZB	Joey Dunn
+SWY2WYQ	Stephen Nichols
+SXZ8KYN	Guruvendhan R
+TELKIN	TIMOTHY ELKIN
+TKD3NRX	John Jackson
+TLF7WDD	Paul Hollar
+TZW0HKT	BOBBY NATION
+VGONZALEZ	Vilma Gonzalez
+VIJAY	UPS ADMIN
+VJC9RWL	chandana podisetty
+VRB1KHR	Cassie Langmann
+VVT1QJS	Deepak Raj Murugan
+VYB6MGY	Shivam Singh
+VZF7DTN	NICHOLAS LOGSDON
+WDV5SNP	PATRICK RYAN
+WJL4LBQ	Sivakumar Ramadoss
+WSH4BYS	Aswanth Baulin
+WWJ5WNJ	Mark Beresford
+WYT5BXC	MICHAEL SCOTT
+XTQ6JFH	Gurpreet Kaur
+XWD6PYQ	Larissa MarangoniColombo
+YBARROSO	Yisel Barroso
+YBLANCO	Yaumara Fiallo Blanco
+YCAMPOS	Yasiel Campos
+YCOBAS	Yunior Cobas
+YJW2PCC	Aanchal Joshi
+YKK5RXP	Robert Perez
+YNY0SBM	Subbarao Yeddala
+YQD3FKV	Patricia Gibbs
+YSUBALDIA	YUDENIA SUBALDIA
+YVARGASCARDE	Yenisleydis Vargas Cardero
+ZDC1QSJ	Nidhi Sharma
+ZZJ6SCH	Katie Armour
+'@
+
+# 2) (Opcional) Descargar la BD desde GitHub raw para actualizar sin tocar el script.
+#    OJO PRIVACIDAD: no subas numeros/nombres reales a un repo PUBLICO (datos personales).
+#    Si dejas BD_URL vacio, se usa solo la embebida.
+$BD_URL = ''   # ej: 'https://raw.githubusercontent.com/garfield310798-cyber/aaa/main/bd.md'
+
+$bdTexto = $bdEmbebida
+if ($BD_URL -ne '') {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $desc = (New-Object Net.WebClient).DownloadString($BD_URL)
+        if ($desc -and $desc.Trim().Length -gt 0) { $bdTexto = $desc }
+    } catch { }
+}
+
+[ServidorTablero]::UsuariosTexto = $bdTexto
+[ServidorTablero]::CarpetaBase = $base
+[ServidorTablero]::Main()
